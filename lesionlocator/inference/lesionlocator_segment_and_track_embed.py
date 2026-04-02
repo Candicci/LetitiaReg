@@ -10,7 +10,8 @@ import numpy as np
 import torch
 import json
 import SimpleITK
-from matplotlib import pyplot as plt
+import matplotlib.pyplot as plt
+# from matplotlib import pyplot as plt
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.utilities.file_and_folder_operations import load_json, join, isfile, maybe_mkdir_p, isdir, subdirs, \
@@ -34,6 +35,81 @@ from lesionlocator.utilities.prompt_handling.prompt_handler import sparse_to_den
 from lesionlocator.utilities.surface_distance_based_measures import compute_surface_distances, compute_surface_dice_at_tolerance, compute_dice_coefficient, compute_robust_hausdorff
 
 
+class EmbeddingExtractor:
+    """Extract intermediate features from specific layers using forward hooks"""
+    
+    def __init__(self, model, layer_names=None):
+        """
+        Args:
+            model: PyTorch model
+            layer_names: List of layer name patterns to match (e.g., ['decoder.stages.0', 'encoder.stages.2'])
+                        If None, extracts from all decoder and encoder stages
+        """
+        self.model = model
+        self.embeddings = {}
+        self.hooks = []
+        self.hooked_layer_names = []
+        self.layer_names = layer_names
+        
+        # Auto-detect decoder/encoder stages if no specific layers provided
+        if layer_names is None:
+            layer_names = self._auto_detect_layers()
+        
+        # Register hooks for matching layers
+        self._register_hooks(layer_names)
+    
+    def _auto_detect_layers(self):
+        """Auto-detect decoder and encoder stage layers"""
+        detected = []
+        for name, _ in self.model.named_modules():
+            if 'decoder.stages' in name or 'encoder.stages' in name:
+                # Only add the stage modules themselves, not sub-modules
+                if name.count('.') == 2:  # e.g., 'decoder.stages.0'
+                    detected.append(name)
+        return detected
+    
+    def _register_hooks(self, layer_names):
+        """Register forward hooks for specified layers"""
+        for name, module in self.model.named_modules():
+            # Check if this layer matches any of the patterns
+            if any(pattern in name for pattern in layer_names):
+                hook = module.register_forward_hook(self._make_hook(name))
+                self.hooks.append(hook)
+                self.hooked_layer_names.append(name)
+                if self.layer_names is not None:  # Only print if explicitly set
+                    print(f"Registered hook for layer: {name}")
+    
+    def _make_hook(self, layer_name):
+        """Create a hook function that stores the output"""
+        def hook(module, input, output):
+            # Store detached copy on CPU to save memory
+            if isinstance(output, tuple):
+                # Some layers return tuples
+                self.embeddings[layer_name] = output[0].detach().cpu().clone()
+            else:
+                self.embeddings[layer_name] = output.detach().cpu().clone()
+        return hook
+    
+    def clear(self):
+        """Clear stored embeddings to free memory"""
+        self.embeddings = {}
+    
+    def remove_hooks(self):
+        """Remove all registered hooks"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+        self.hooked_layer_names = []
+    
+    def get_embeddings(self):
+        """Get dictionary of extracted embeddings"""
+        return dict(self.embeddings)
+    
+    def get_layer_names(self):
+        """Get list of layers being extracted"""
+        return list(self.hooked_layer_names)
+
+
 class LesionLocatorSegmenter(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
@@ -47,14 +123,24 @@ class LesionLocatorSegmenter(object):
                  visualize: bool = False,
                  track: bool = False,
                  adaptive_mode: bool = False,
-                 empty_prompt: bool = False):
+                 embedding_output_folder: str = None,
+                 lesion_focus: bool = False,
+                 crop_size: int = 64):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
-        self.empty_prompt = empty_prompt
+        self.embedding_output_folder = embedding_output_folder
+        self.lesion_focus = lesion_focus
+        self.crop_size = crop_size
 
         self.plans_manager, self.configuration_manager, self.list_of_parameters, self.network, self.dataset_json, \
         self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
+
+        # Add embedding extraction attributes
+        self.embedding_extractor = None
+        self.embedding_extractor_tracker = None
+        self.extract_embeddings = False
+        self.embedding_layer_names = None
 
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
@@ -100,6 +186,9 @@ class LesionLocatorSegmenter(object):
         
         print('Tracking: ', self.track)
         print('Adaptive mode: ', self.adaptive_mode)
+        print('Lesion focus cropping: ', self.lesion_focus)
+        if self.lesion_focus:
+            print(f'Crop size: {self.crop_size}x{self.crop_size}x{self.crop_size}')
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              model_track_training_output_dir: str,
@@ -122,7 +211,9 @@ class LesionLocatorSegmenter(object):
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
-            ckpt_path = join(model_training_output_dir, f'fold_{f}', checkpoint_name)
+            # load fold_4 as the finetuned model
+            f_ft = 4
+            ckpt_path = join(model_training_output_dir, f'fold_{f_ft}', checkpoint_name)
             # print(f"Loading segmentation model checkpoint from: {ckpt_path}")
             checkpoint = torch.load(ckpt_path,
                                     map_location=torch.device('cpu'), weights_only=False)
@@ -134,13 +225,10 @@ class LesionLocatorSegmenter(object):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
 
             # check if best_model.pth is available, else use checkpoint_final.pth
-
-            #!!!
-            f = 4
-            if isfile(join(model_training_output_dir, f'fold_{f}', 'best_model.pth')):
-                ckpt_path = join(model_training_output_dir, f'fold_{f}', 'best_model.pth')
+            if isfile(join(model_training_output_dir, f'fold_{f_ft}', 'best_model.pth')):
+                ckpt_path = join(model_training_output_dir, f'fold_{f_ft}', 'best_model.pth')
             else:
-                ckpt_path = join(model_training_output_dir, f'fold_{f}', 'checkpoint_final.pth')
+                ckpt_path = join(model_training_output_dir, f'fold_{f_ft}', 'checkpoint_final.pth')
 
             print(f"Loading segmentation model checkpoint from: {ckpt_path}")
 
@@ -217,11 +305,12 @@ class LesionLocatorSegmenter(object):
             #         if seg_key in checkpoint_tracker['network_weights'].keys():
             #             checkpoint_tracker['network_weights'][key] = checkpoint['network_weights'][seg_key]
 
-
             parameters_tracker.append(checkpoint_tracker['network_weights'])
 
         configuration_manager_tracker = plans_manager_tracker.get_configuration(configuration_name_tracker)
+        parameters_tracker[0]['unet_patch_size'] = torch.tensor(configuration_manager_tracker.patch_size)
         # set spacing
+        # configuration_manager.set_spacing([1.5, 1.5, 1.5])
         # configuration_manager_tracker.set_spacing([1.5, 1.5, 1.5])
         # restore networks
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager_tracker, dataset_json_tracker)
@@ -231,7 +320,6 @@ class LesionLocatorSegmenter(object):
             raise RuntimeError(f'Unable to locate trainer class {trainer_name_tracker} in lesionlocator.training.LesionLocatorTrainer. '
                                f'Please place it there (in any .py file)!')
         
-        print('configuration ', configuration_manager_tracker.patch_size)
         network_tracker = trainer_class.build_network_architecture(
             configuration_manager_tracker.network_arch_class_name,
             configuration_manager_tracker.network_arch_init_kwargs,
@@ -241,14 +329,13 @@ class LesionLocatorSegmenter(object):
             configuration_manager_tracker.patch_size,
             enable_deep_supervision=False
         )
-        
+       
         self.plans_manager_tracker = plans_manager_tracker
         self.configuration_manager_tracker = configuration_manager_tracker
         self.list_of_parameters_tracker = parameters_tracker
 
         network_tracker.load_state_dict(parameters_tracker[0])
         self.network_tracker = network_tracker
-
         self.dataset_json_tracker = dataset_json_tracker
         self.trainer_name_tracker = trainer_name_tracker
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
@@ -262,6 +349,52 @@ class LesionLocatorSegmenter(object):
         print('Using target spacing: ', self.target_spacing)
         print('Segmentation configuration: ', self.configuration_manager)
         print('Tracking configuration: ', self.configuration_manager_tracker)
+
+    def enable_embedding_extraction(self, layer_names=None):
+        """
+        Enable embedding extraction from specified layers
+        
+        Args:
+            layer_names: List of layer name patterns. Examples:
+                         ['decoder.stages.0', 'encoder.stages.3'] - specific stages
+                         ['decoder.stages', 'encoder.stages'] - all stages
+                         None - auto-detect all decoder/encoder stages
+        """
+        self.extract_embeddings = True
+        self.embedding_layer_names = layer_names
+        
+        print(f"\n=== Enabling embedding extraction ===")
+        print(f"Layer patterns: {layer_names if layer_names else 'Auto-detect'}")
+        
+        # Create extractor for segmentation network (uses 'decoder.stages')
+        seg_layer_names = layer_names if layer_names else ['decoder.stages.4']
+        self.embedding_extractor = EmbeddingExtractor(self.network, seg_layer_names)
+        print(f"Segmentation network - extracting from: {self.embedding_extractor.get_layer_names()}")
+        
+        # Create extractor for tracking network if it exists (uses 'unet.decoder.stages')
+        if hasattr(self, 'network_tracker') and self.network_tracker is not None:
+            # For tracker, convert 'decoder' to 'unet.decoder' in layer names
+            if layer_names:
+                track_layer_names = [name.replace('decoder', 'unet.decoder') if not name.startswith('unet.') else name 
+                                    for name in layer_names]
+            else:
+                track_layer_names = ['unet.decoder.stages.4']
+            
+            self.embedding_extractor_tracker = EmbeddingExtractor(
+                self.network_tracker, track_layer_names
+            )
+            print(f"Tracking network - extracting from: {self.embedding_extractor_tracker.get_layer_names()}")
+        print("=====================================\n")
+
+    def disable_embedding_extraction(self):
+        """Disable embedding extraction and remove hooks"""
+        self.extract_embeddings = False
+        if self.embedding_extractor is not None:
+            self.embedding_extractor.remove_hooks()
+            self.embedding_extractor = None
+        if self.embedding_extractor_tracker is not None:
+            self.embedding_extractor_tracker.remove_hooks()
+            self.embedding_extractor_tracker = None
 
     @staticmethod
     def auto_detect_available_folds(model_training_output_dir, checkpoint_name):
@@ -290,7 +423,7 @@ class LesionLocatorSegmenter(object):
         """
         assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
                                       "So if there are 3 parts then valid part IDs are 0, 1, 2")
-                                      
+        
         if os.path.isdir(source_folder_or_file):
             assert os.path.isdir(output_folder_or_file) and os.path.isdir(prompt_folder_or_file), \
                 "If '-i' is a folder then '-o' (output) and '-p' (prompt) must also be folders."
@@ -339,10 +472,11 @@ class LesionLocatorSegmenter(object):
             prompt_files = [prompt_folder_or_file]
             output_files = [join(output_folder_or_file, os.path.basename(source_folder_or_file))]
 
-        # indices = [j for j, i in enumerate(input_files) if 'TP0' not in os.path.basename(i)]
-        # input_files = [input_files[i] for i in indices]
-        # prompt_files = [prompt_files[i] for i in indices]
-        # output_files = [output_files[i] for i in indices]
+        # only evaluate tracking using TP1 and TP2
+        indices = [j for j, i in enumerate(input_files) if 'TP0' not in os.path.basename(i)]
+        input_files = [input_files[i] for i in indices]
+        prompt_files = [prompt_files[i] for i in indices]
+        output_files = [output_files[i] for i in indices]
 
         # Truncate output files
         print('Total number of input files: ', len(input_files))
@@ -395,6 +529,10 @@ class LesionLocatorSegmenter(object):
             print("Starting data iterator processing...")
             
             for preprocessed in data_iterator:
+                # if 'TP1_058' not in preprocessed['ofile']:
+                #     continue
+                print(f'Processing file: {preprocessed["ofile"]}', flush=True)
+
                 data_count += 1
                 iter_start_time = time.time()
                 print(f"\n=== Starting item {data_count} ===", flush=True)
@@ -464,6 +602,7 @@ class LesionLocatorSegmenter(object):
                                 continue
                             if os.path.basename(ofile) not in error_all[k].keys():
                                 error_all[k][patient_tp]={'mean':0, 'per_lesion':[]}
+                        # p_sparse = p
 
                         p = sparse_to_dense_prompt(p, prompt_type, array=data)
 
@@ -492,7 +631,7 @@ class LesionLocatorSegmenter(object):
                             prev_tp_candidate = os.path.basename(ofile).replace('TP1', 'TP0')
                             if os.path.exists(os.path.join(output_folder_or_file, prev_tp_candidate + '_lesion_' + str(inst_id) + '.nii.gz')):
                                 prev_tp = prev_tp_candidate
-                                                    
+                                                                                                    
                         if self.track and (prev_tp is not None):
                             use_prev_tp = True
                             prev_seg_sitk = SimpleITK.ReadImage(os.path.join(output_folder_or_file, prev_tp+'_lesion_'+str(inst_id)+'.nii.gz'))
@@ -516,13 +655,147 @@ class LesionLocatorSegmenter(object):
                             print('Use previous timepoint prediction as prompt: ', prev_tp+'_lesion_'+str(inst_id))
                             prompt_bl = torch.from_numpy(prev_seg_resampled).unsqueeze(0).to(self.device).half()
                             print('Resampled prompt shape: ', prompt_bl.shape)
+                            
+                            # Apply lesion-focused cropping if enabled
+                            if self.lesion_focus:
+                                # Get center of the mask
+                                # for bl data
+                                bl_prompt_coords = torch.where(prompt_bl > 0)
+                                
+                                # Get center of the mask
+                                bl_spacing = preprocessed['bl_data_properties']['spacing']
+                                data_spacing = preprocessed['data_properties']['spacing']
+
+                                # resample bl_prompt from bl_spacing to data_spacing if they are different
+                                if bl_spacing != data_spacing:
+                                    print(f'Resampling baseline prompt from spacing {bl_spacing} to {data_spacing}')
+                                    bl_prompt_resampled = self.configuration_manager.resampling_fn_seg(
+                                        prompt_bl.cpu().numpy(), 
+                                        data.shape[1:], 
+                                        bl_spacing, 
+                                        data_spacing
+                                    )[0]
+                                    prompt_bl_resampled = torch.from_numpy(bl_prompt_resampled).unsqueeze(0).to(self.device).half()
+                                    print('Resampled baseline prompt shape: ', prompt_bl_resampled.shape)
+                                
+                                    prompt_coords = torch.where(prompt_bl_resampled > 0)
+                                else:
+                                    prompt_coords = bl_prompt_coords
+
+                                if len(prompt_coords[0]) > 0:
+                                    if prompt_bl.dim() == 4:
+                                        prompt_coords = prompt_coords[1:]  # Add batch dimension if missing
+                                    
+                                    center = [
+                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
+                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
+                                    ]
+                                    
+                                    half_size = self.crop_size // 2
+                                    if data.dim() == 4:
+                                        data_shape = data.shape[1:]  # Add batch dimension if missing
+                                    else:
+                                        data_shape = data.shape
+
+                                    bbox_centered = [
+                                        max(0, center[0] - half_size),
+                                        min(data_shape[0], center[0] + half_size),
+                                        max(0, center[1] - half_size),
+                                        min(data_shape[1], center[1] + half_size),
+                                        max(0, center[2] - half_size),
+                                        min(data_shape[2], center[2] + half_size)
+                                    ]
+                                
+                            
+                            # Clear embeddings before prediction
+                            if self.extract_embeddings and self.embedding_extractor_tracker is not None:
+                                self.embedding_extractor_tracker.clear()
+                            
                             # Predict the logits using the preprocessed data and the prompt
                             prediction = self.track_single_lesion(torch.from_numpy(bl_data[np.newaxis,:]).to(self.device), data.unsqueeze(0).to(self.device), prompt_bl.unsqueeze(0)).cpu()
+                                                        
+                            prediction = prediction.cpu()
                             seg = torch.softmax(prediction, 0).argmax(0)
                             pred = seg.detach().cpu().numpy().astype(np.uint8)
                             print('Prediction shape: ', pred.shape)
                             print('Ground truth shape: ',  gt_mask[0].shape)
                             dice_score = compute_dice_coefficient(gt_mask[0], pred)
+                            
+                            # Save tracking embeddings if extraction is enabled
+                            if self.extract_embeddings and self.embedding_extractor_tracker is not None:
+                                track_embeddings = self.embedding_extractor_tracker.get_embeddings()
+
+                                # plot 10 feature maps from the last layer
+                                # if self.visualize:
+                                #     # import matplotlib.pyplot as plt
+                                #     for k, v in track_embeddings.items():
+                                #         feat = v.numpy()
+                                #         # num_feats = feat.shape[1]
+                                #         #fig, axes = plt.subplots(1, min(5, num_feats), figsize=(20, 2))
+
+                                #         # apply global average pooling to get a single 3D map
+                                #         # [n, c, d, h, w] -> [n, d, h, w]
+                                #         #feat = feat.mean(axis=1)
+                                #         _feat = feat.max(axis=1)[0]
+                                #         #for i in range(min(5, num_feats)):
+                                #         plt.imshow(_feat[_feat.shape[0]//2, :, :], cmap='jet')
+                                #         plt.axis('off')
+                                #         plt.suptitle(f'Layer: {k} Feature Maps')
+                                #         plt.savefig(f'{self.embedding_output_folder}/{os.path.basename(ofile)}_track_embeddings_layer_{k}_lesion_{inst_id}.png')
+                                #         plt.close()
+                                                                
+                                if len(track_embeddings) > 0:
+                                    track_emb_path = os.path.join(
+                                        self.embedding_output_folder, 
+                                        f'{os.path.basename(ofile)}_lesion_{inst_id}_track_embeddings.npz'
+                                    )
+                                    track_embeddings_np = {}
+                                    for layer_name, feat in track_embeddings.items():
+                                        if 'nonlin' in layer_name or 'norm' in layer_name or 'convs' in layer_name or 'all_modules' in layer_name:
+                                            continue  # skip nonlin, norm, and conv layers
+                                        key = layer_name.replace('.', '_')
+                                        track_embeddings_np[key] = feat.numpy()
+                                    track_embeddings_np['dice'] = dice_score
+
+                                    if self.lesion_focus and bbox_centered is not None:
+                                        track_embeddings_np['bbox'] = np.array(bbox_centered)
+                                        # # convert pixel location to physical spacing?
+                                        # center_physical = [
+                                        #     center[0] * self.target_spacing[0],
+                                        #     center[1] * self.target_spacing[1],
+                                        #     center[2] * self.target_spacing[2]
+                                        # ]
+                                        # calculate the center of nonezeros in mask_gt[0]
+                                        prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
+                                        center = [
+                                            int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                        ]
+                                        data_spacing = preprocessed['data_properties']['spacing'][::-1]
+                                        center_physical = [
+                                            center[0] * data_spacing[0],
+                                            center[1] * data_spacing[1],
+                                            center[2] * data_spacing[2]
+                                        ]
+                                        track_embeddings_np['center'] = np.array(center)
+                                        track_embeddings_np['center_physical'] = np.array(center_physical)
+                                        track_embeddings_np['crop_size'] = self.crop_size
+
+                                        data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
+                                        track_embeddings_np['data_physical_size'] = data_physical_size
+
+                                    # check the byte size of track_embeddings_np
+                                    total_bytes = sum(feat.nbytes for key, feat in track_embeddings_np.items() if 'decoder_stages_2' in key)
+                                    print(f'Total bytes for tracking embeddings of lesion {inst_id}: {total_bytes} bytes')
+                                    print(f'Embeddings shape and dtype for lesion {inst_id}:')
+                                    for key, feat in track_embeddings_np.items():
+                                        if isinstance(feat, np.ndarray) and 'decoder_stages_2' in key:
+                                            print(f'  {key}: shape={feat.shape}, dtype={feat.dtype}')
+                                    # print(f'Total size of tracking embeddings for lesion {inst_id}: {total_bytes / 1024**2:.2f} MB')
+                                    np.savez_compressed(track_emb_path, **track_embeddings_np)
+                                    print(f'Saved tracking embeddings to {track_emb_path}')
 
                             if dice_score < 0.1:
                                 print(f'Low Dice score {dice_score:.2f} for lesion {inst_id} at timepoint {timepoint}. Disabling tracking...')
@@ -534,18 +807,137 @@ class LesionLocatorSegmenter(object):
                             error_all['track_targets']['all']+=1
                             error_all['track_targets'][timepoint]['all']+=1
 
-                        # if prev_tp is None and ('TP0' in current_tp or not self.track or low_score or self.adaptive_mode):
-                        # if (not self.track) or ((prev_tp is None) and self.adaptive_mode):
                         if (not self.track) or (prev_tp is None) or (low_score and self.adaptive_mode):
                             use_prev_tp = False
                             print('Use current timepoint ground truth as prompt: ', p.shape)
+                            # Apply lesion-focused cropping if enabled
+                            if self.lesion_focus:
+                                prompt_coords = torch.where(p > 0)
+                                if len(prompt_coords[0]) > 0:
+                                    center = [
+                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
+                                        int((prompt_coords[3].min().item() + prompt_coords[3].max().item()) / 2)
+                                    ]
+                                    # center_physical = [
+                                    #     center[0] * self.target_spacing[0],
+                                    #     center[1] * self.target_spacing[1],
+                                    #     center[2] * self.target_spacing[2]
+                                    # ]
+                                    half_size = self.crop_size // 2
+                                    bbox_centered = [ 
+                                        max(0, center[0] - half_size),
+                                        min(data.shape[1], center[0] + half_size),
+                                        max(0, center[1] - half_size),
+                                        min(data.shape[2], center[1] + half_size),
+                                        max(0, center[2] - half_size),
+                                        min(data.shape[3], center[2] + half_size)
+                                    ]
+                                    
+                                    # Adjust if bbox goes out of bounds (ensure crop_size x crop_size x crop_size)
+                                    for i in range(3):
+                                        start_idx = i * 2
+                                        end_idx = start_idx + 1
+                                        current_size = bbox_centered[end_idx] - bbox_centered[start_idx]
+                                        
+                                        if current_size < self.crop_size:
+                                            deficit = self.crop_size - current_size
+                                            if bbox_centered[start_idx] == 0:
+                                                bbox_centered[end_idx] = min(bbox_centered[end_idx] + deficit, data.shape[i+1])
+                                            elif bbox_centered[end_idx] == data.shape[i+1]:
+                                                bbox_centered[start_idx] = max(bbox_centered[start_idx] - deficit, 0)
+                                    
+                                    # Crop data
+                                    data_cropped = data[:, 
+                                                       bbox_centered[0]:bbox_centered[1],
+                                                       bbox_centered[2]:bbox_centered[3],
+                                                       bbox_centered[4]:bbox_centered[5]].clone()
+                                    p_cropped = p[:,
+                                                 bbox_centered[0]:bbox_centered[1],
+                                                 bbox_centered[2]:bbox_centered[3],
+                                                 bbox_centered[4]:bbox_centered[5]].clone()
+                                    
+                                    print(f'Lesion-focused cropping: center={center}, bbox={bbox_centered}')
+                                    print(f'Cropped shapes: data={data_cropped.shape}, prompt={p_cropped.shape}')
+                                else:
+                                    print('Warning: Empty prompt mask, skipping cropping')
+                                    data_cropped = data
+                                    p_cropped = p
+                                    bbox_centered = None
+                            else:
+                                data_cropped = data
+                                p_cropped = p
+                                bbox_centered = None
+                            
+                            # Clear embeddings before prediction
+                            if self.extract_embeddings and self.embedding_extractor is not None:
+                                self.embedding_extractor.clear()
+                            
                             # Predict the logits using the preprocessed data and the prompt
-                            prediction = self.predict_logits_from_preprocessed_data(data, p).cpu()
+                            prediction_cropped = self.predict_logits_from_preprocessed_data(data_cropped, p_cropped).cpu()
+                            
+                            # Reconstruct full-size prediction if cropping was applied
+                            if self.lesion_focus and bbox_centered is not None:
+                                prediction = torch.zeros((prediction_cropped.shape[0],) + data.shape[1:], 
+                                                        dtype=prediction_cropped.dtype)
+                                prediction[:,
+                                          bbox_centered[0]:bbox_centered[1],
+                                          bbox_centered[2]:bbox_centered[3],
+                                          bbox_centered[4]:bbox_centered[5]] = prediction_cropped
+                            else:
+                                prediction = prediction_cropped
+                            
+                            prediction = prediction.cpu()
                             seg = torch.softmax(prediction, 0).argmax(0)
                             pred = seg.detach().cpu().numpy().astype(np.uint8)
                             print('Prediction shape: ', pred.shape)
-                            print('Ground truth shape: ', gt_mask[0].shape)
                             dice_score = compute_dice_coefficient(gt_mask[0], pred)
+                            
+                            # Save segmentation embeddings if extraction is enabled
+                            if self.extract_embeddings and self.embedding_extractor is not None:
+                                seg_embeddings = self.embedding_extractor.get_embeddings()
+                                
+                                if len(seg_embeddings) > 0:
+                                    seg_emb_path = os.path.join(
+                                        self.embedding_output_folder, 
+                                        f'{os.path.basename(ofile)}_lesion_{inst_id}_seg_embeddings.npz'
+                                    )
+                                    seg_embeddings_np = {}
+                                    for layer_name, feat in seg_embeddings.items():
+                                        if 'nonlin' in layer_name or 'norm' in layer_name or 'convs' in layer_name or 'all_modules' in layer_name:
+                                            continue  # skip nonlin, norm, and conv layers
+
+                                        key = layer_name.replace('.', '_')
+                                        seg_embeddings_np[key] = feat.numpy()
+                                    
+                                    for key, feat in seg_embeddings_np.items():
+                                        print(f'  {key}: shape={feat.shape}, dtype={feat.dtype}')
+
+                                    seg_embeddings_np['dice'] = dice_score
+                                    if self.lesion_focus and bbox_centered is not None:
+                                        seg_embeddings_np['bbox'] = np.array(bbox_centered)
+                                        prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
+                                        center = [
+                                            int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                        ]
+                                        # convert center to physical space using spacing
+                                        data_spacing = preprocessed['data_properties']['spacing']
+                                        center_physical = [
+                                            center[0] * data_spacing[0],
+                                            center[1] * data_spacing[1],
+                                            center[2] * data_spacing[2]
+                                        ]
+                                        seg_embeddings_np['center'] = center
+                                        seg_embeddings_np['center_physical'] = np.array(center_physical)
+                                        seg_embeddings_np['crop_size'] = self.crop_size
+
+                                        data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
+                                        seg_embeddings_np['data_physical_size'] = data_physical_size
+                                    print(f'Embeddings shape and dtype for lesion {inst_id}:')
+                                    np.savez_compressed(seg_emb_path, **seg_embeddings_np)
+                                    print(f'Saved segmentation embeddings to {seg_emb_path}')
 
                         if prev_tp is None:
                             error_all['new_appears']['all']+=1
@@ -598,7 +990,7 @@ class LesionLocatorSegmenter(object):
                         print('Avg Mean Dice: ', np.mean(dice_score_all))
                         print('Avg Mean Hausdorff: ',  np.mean(hausdorff_score_all))
                         print('Avg Mean NSD: ', np.mean(nsd_score_all))
-                        print('Avg Lesion Detection Score: {:.2f}%'.format((error_all['lesion_found']['all'] / error_all['lesion_all']['all']) * 100))
+                        print('Avg Lesion Detection Score: {:.2f}%'.format((error_all['lesion_found']['all'] / (1e-7+error_all['lesion_all']['all'])) * 100))
                         with open(os.path.join(output_folder_or_file, 'error_dict.json'), 'w') as fjson:
                             json.dump(error_all, fjson)
                         print('----------')
@@ -689,16 +1081,15 @@ class LesionLocatorSegmenter(object):
                         # if dice_score < 0.1:
                         # # if low_score and not self.adaptive_mode:
                         #     out_file += '_tracked_failed'
-
-                        # # save predict nii.gz
-                        # if 'prediction' in locals():
-                        #     r.append(
-                        #         export_pool.starmap_async(
-                        #             export_prediction_from_logits,
-                        #             ((prediction, properties, self.configuration_manager, self.plans_manager,
-                        #                 self.dataset_json, out_file, False),)
-                        #         )
-                        #     )
+                    
+                        if 'prediction' in locals() and 'TP2' not in os.path.basename(ofile):
+                            r.append(
+                                export_pool.starmap_async(
+                                    export_prediction_from_logits,
+                                    ((prediction, properties, self.configuration_manager, self.plans_manager,
+                                        self.dataset_json, out_file, False),)
+                                )
+                            )
                             
 
                         # no multiprocessing
@@ -717,12 +1108,15 @@ class LesionLocatorSegmenter(object):
             error_all['dice']['mean']= np.mean(dice_score_all)
             error_all['hausdorff']['mean'] = np.mean(hausdorff_score_all)
             error_all['nsd']['mean'] = np.mean(nsd_score_all)
-            error_all['lesion_found']['mean'] = (error_all['lesion_found']['all']/error_all['lesion_all']['all'])*100
+            error_all['lesion_found']['mean'] = (error_all['lesion_found']['all']/(1e-7+error_all['lesion_all']['all']))*100
             for tp in ['TP0','TP1','TP2']:
                 error_all['dice'][tp]['mean']=np.mean(error_all['dice'][tp]['all'])
                 error_all['hausdorff'][tp]['mean']=np.mean(error_all['hausdorff'][tp]['all'])
                 error_all['nsd'][tp]['mean']=np.mean(error_all['nsd'][tp]['all'])
-                error_all['lesion_found'][tp]['mean'] = (error_all['lesion_found'][tp]['all']/error_all['lesion_all'][tp]['all'])*100
+                if error_all['lesion_all'][tp]['all'] == 0:
+                    error_all['lesion_found'][tp]['mean'] = 0
+                else:
+                    error_all['lesion_found'][tp]['mean'] = error_all['lesion_found'][tp]['all']/(1e-7+error_all['lesion_all'][tp]['all'])*100
             with open(os.path.join(output_folder_or_file, 'error_dict.json'), 'w') as fjson:
                 json.dump(error_all, fjson)
             
@@ -749,9 +1143,6 @@ class LesionLocatorSegmenter(object):
         prediction = None
 
         # Add the dense prompt to the data
-        if self.empty_prompt:
-            data_empty_prompt = torch.cat([data, torch.zeros_like(dense_prompt)], dim=0)
-
         data = torch.cat([data, dense_prompt], dim=0)
 
         for params in self.list_of_parameters:
@@ -766,15 +1157,9 @@ class LesionLocatorSegmenter(object):
             # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
             # this actually saves computation time
             if prediction is None:
-                if self.empty_prompt:
-                    prediction = self.predict_sliding_window_return_logits(data_empty_prompt, dense_prompt).to('cpu')
-                else:
-                    prediction = self.predict_sliding_window_return_logits(data, dense_prompt).to('cpu')
+                prediction = self.predict_sliding_window_return_logits(data, dense_prompt).to('cpu')
             else:
-                if self.empty_prompt:
-                    prediction += self.predict_sliding_window_return_logits(data_empty_prompt, dense_prompt).to('cpu')
-                else:
-                    prediction += self.predict_sliding_window_return_logits(data, dense_prompt).to('cpu')
+                prediction += self.predict_sliding_window_return_logits(data, dense_prompt).to('cpu')
 
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
@@ -797,14 +1182,7 @@ class LesionLocatorSegmenter(object):
         
         # Use mixed precision to save memory
         with torch.autocast(self.device.type, dtype=torch.float16, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            
-            # # try to pass in prompts with empty input
-            # if self.empty_prompt and (prompt is not None and len(prompt) != 0):
-            #     prompt = torch.zeros_like(prompt, dtype=prompt.dtype)
-            #     prompt = prompt.to(self.device)
-            #     print("Using empty prompt for inference")
-
-            output = self.network_tracker(x0, x1, prompt, is_inference=True)
+            output = self.network_tracker(x0, x1, prompt, is_inference=True, visualize=False, lesion_focused=self.lesion_focus)
             prediction = output[0] if isinstance(output, tuple) else output
             
             # Clear intermediate outputs immediately
@@ -828,7 +1206,7 @@ class LesionLocatorSegmenter(object):
                         x1_flip = torch.flip(x1, [axis])
                         prompt_flip = torch.flip(prompt, [axis])
                         
-                        mirror_output = self.network_tracker(x0_flip, x1_flip, prompt_flip, is_inference=True)
+                        mirror_output = self.network_tracker(x0_flip, x1_flip, prompt_flip, is_inference=True, visualize=False, lesion_focused=self.lesion_focus)
                         mirror_pred = mirror_output[0] if isinstance(mirror_output, tuple) else mirror_output
                         
                         # Immediate cleanup
@@ -1079,6 +1457,11 @@ class LesionLocatorSegmenter(object):
                 gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
                                             value_scaling_factor=10,
                                             device=results_device)
+                if self.lesion_focus:
+                    # crop gaussian to crop size
+                    start = [(gs - cs) // 2 for gs, cs in zip(gaussian.shape, [self.crop_size]*3)]
+                    end = [start[i] + self.crop_size for i in range(3)]
+                    gaussian = gaussian[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
             else:
                 gaussian = 1
 
@@ -1151,9 +1534,14 @@ class LesionLocatorSegmenter(object):
                 print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
 
             # if input_image is smaller than tile_size we need to pad it to tile_size.
-            data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
-                                                       'constant', {'value': 0}, True,
-                                                       None)
+            if not self.lesion_focus: 
+                data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
+                                                        'constant', {'value': 0}, True,
+                                                        None)
+            else:
+                data, slicer_revert_padding = pad_nd_image(input_image, [self.crop_size, self.crop_size, self.crop_size],
+                                                        'constant', {'value': 0}, True,
+                                                        None)
 
             # Make sure we get only the patches we need to predict, i.e. overlab with the prompt
             slicers = self._internal_get_sliding_window_slicers(data.shape[1:], dense_prompt)
@@ -1231,8 +1619,16 @@ def segment_and_track():
                         help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet'], default='ct', help="Use this to set the modality")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
-    parser.add_argument('--empty_prompt', action='store_true', help='Set this flag if you want to run the predictor with an empty prompt and will likely lead to worse performance.')
-
+    parser.add_argument('--lesion_focus', action='store_true', help='Enable lesion-focused inference by prioritizing patches overlapping with the prompt, rather than strict bbox-focused. This can improve performance for larger lesions that do not fit entirely within the patch size.')
+    parser.add_argument('--crop_size', type=int, default=128, help='Crop size for lesion-focused inference. Only used if --lesion_focus is set. Default: 128')
+    parser.add_argument('--extract_embeddings', action='store_true', required=False, default=False,
+                        help='Extract and save intermediate layer embeddings from both segmentation and tracking networks') 
+    parser.add_argument('--embedding_output_folder', type=str, required=False, default=None,
+                        help='Folder to save extracted embeddings. Must be specified if --extract_embeddings is set.')
+    parser.add_argument('--embedding_layers', type=str, nargs='+', required=False, default=None,
+                        help='Specific layer names to extract embeddings from. Examples: '
+                             'decoder.stages.0 encoder.stages.3. If not specified, auto-detects all stages.')
+    
     print(
         "\n#######################################################################\nPlease cite the following paper "
         "when using LesionLocator:\n"
@@ -1263,6 +1659,10 @@ def segment_and_track():
     else:
         device = torch.device('mps')
 
+    if args.embedding_output_folder is not None and not isdir(args.embedding_output_folder):
+        print(f"Embedding output folder {args.embedding_output_folder} does not exist. Creating it...")
+        maybe_mkdir_p(args.embedding_output_folder)
+
     predictor = LesionLocatorSegmenter(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
@@ -1274,15 +1674,31 @@ def segment_and_track():
                                 visualize=args.visualize,
                                 track=args.track,
                                 adaptive_mode=args.adaptive_mode,
-                                empty_prompt=args.empty_prompt)
-    
+                                lesion_focus=args.lesion_focus,
+                                crop_size=args.crop_size,
+                                embedding_output_folder=args.embedding_output_folder)
     optimized_ckpt = "bbox_optimized" if args.t == 'box' else "point_optimized"
     checkpoint_folder = join(args.m, 'LesionLocatorSeg', optimized_ckpt)
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
     # checkpoint_folder_track = join(args.m, 'LesionLocatorSeg')
     predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth")
+    
+    # Enable embedding extraction if requested
+    if args.extract_embeddings:
+        # Use specific layers if provided, otherwise use decoder.stages.4 for both tracker and segmentor
+        if args.embedding_layers is None:
+            # Default: decoder stage 4 (last decoder stage before segmentation head)
+            embedding_layers = ['decoder.stages.4']
+        else:
+            embedding_layers = args.embedding_layers
+        predictor.enable_embedding_extraction(layer_names=embedding_layers)
+    
     predictor.predict_from_files(args.i, args.o, args.p, args.t,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
                                  num_parts=1, part_id=0)
+    
+    # Clean up hooks when done
+    if args.extract_embeddings:
+        predictor.disable_embedding_extraction()

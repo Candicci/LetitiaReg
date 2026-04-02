@@ -135,30 +135,12 @@ class TrainingPreprocessor(object):
         bl_files = None
 
         if track:
-            if 'TP0' in image_files[0]:
-                candidate = [imf.replace('TP0', 'TP1') for imf in image_files]
-                if self.all_exist(candidate):
-                    bl_files = candidate
-                    if train:
-                        bl_seg_file = [seg_file.replace('TP0', 'TP1') if seg_file is not None else None]
-                else:
-                    candidate = [imf.replace('TP0', 'TP2') for imf in image_files]
-                    if self.all_exist(candidate):
-                        bl_files = candidate
-                        if train:
-                            bl_seg_file = [seg_file.replace('TP0', 'TP2') if seg_file is not None else None]
             if 'TP1' in image_files[0]:
                 candidate = [imf.replace('TP1', 'TP0') for imf in image_files]
                 if self.all_exist(candidate):
                     bl_files = candidate
                     if train:
                         bl_seg_file = [seg_file.replace('TP1', 'TP0') if seg_file is not None else None]
-                else:
-                    candidate = [imf.replace('TP1', 'TP2') for imf in image_files]
-                    if self.all_exist(candidate):
-                        bl_files = candidate
-                        if train:
-                            bl_seg_file = [seg_file.replace('TP1', 'TP2') if seg_file is not None else None]
             elif 'TP2' in image_files[0]:
                 candidate_tp1 = [imf.replace('TP2', 'TP1') for imf in image_files]
                 if self.all_exist(candidate_tp1):
@@ -182,8 +164,6 @@ class TrainingPreprocessor(object):
 
         if self.verbose:
             print(seg_file)
-
-        # resample and normalize data and seg
         data, seg, data_properties = self.run_case_npy(data, seg, data_properties, plans_manager, configuration_manager,
                                       dataset_json)
         
@@ -191,31 +171,31 @@ class TrainingPreprocessor(object):
         if hasattr(configuration_manager, 'patch_size') and configuration_manager.patch_size is not None:
             # Find center point for cropping (use lesion center if available)
             center_point = None
-            # if seg is not None:
-            #     # Find center of largest lesion for cropping
-            #     unique_labels = np.unique(seg)
-            #     lesion_labels = unique_labels[unique_labels > 0]
+            if seg is not None:
+                # Find center of largest lesion for cropping
+                unique_labels = np.unique(seg)
+                lesion_labels = unique_labels[unique_labels > 0]
                 
-            #     if len(lesion_labels) > 0:
-            #         # Use the largest lesion as center
-            #         largest_lesion = None
-            #         largest_size = 0
+                if len(lesion_labels) > 0:
+                    # Use the largest lesion as center
+                    largest_lesion = None
+                    largest_size = 0
                     
-            #         for label in lesion_labels:
-            #             lesion_mask = (seg == label)
-            #             lesion_size = np.sum(lesion_mask)
-            #             if lesion_size > largest_size:
-            #                 largest_size = lesion_size
-            #                 largest_lesion = label
+                    for label in lesion_labels:
+                        lesion_mask = (seg == label)
+                        lesion_size = np.sum(lesion_mask)
+                        if lesion_size > largest_size:
+                            largest_size = lesion_size
+                            largest_lesion = label
                     
-            #         if largest_lesion is not None:
-            #             lesion_coords = np.where(seg[0] == largest_lesion)
-            #             if len(lesion_coords[0]) > 0:
-            #                 center_point = tuple(int(np.mean(coords)) for coords in lesion_coords)
-            #                 if self.verbose:
-            #                     print(f'Using lesion {largest_lesion} center as crop center: {center_point}')
+                    if largest_lesion is not None:
+                        lesion_coords = np.where(seg[0] == largest_lesion)
+                        if len(lesion_coords[0]) > 0:
+                            center_point = tuple(int(np.mean(coords)) for coords in lesion_coords)
+                            if self.verbose:
+                                print(f'Using lesion {largest_lesion} center as crop center: {center_point}')
             
-            # Crop to patch size, use image center for cropping
+            # Crop to patch size
             data, seg, crop_info = self.crop_to_patch_size(data, seg, configuration_manager.patch_size, center_point)
             
             # Store crop information in properties
@@ -258,17 +238,18 @@ class TrainingPreprocessor(object):
 
                     center_point_bl = None
 
-                    # if largest_lesion is not None:
-                    #     lesion_coords = np.where(bl_seg[0] == largest_lesion)
-                    #     if len(lesion_coords[0]) > 0:
-                    #         center_point_bl = tuple(int(np.mean(coords)) for coords in lesion_coords)
+                    if largest_lesion is not None:
+                        lesion_coords = np.where(bl_seg[0] == largest_lesion)
+                        if len(lesion_coords[0]) > 0:
+                            center_point_bl = tuple(int(np.mean(coords)) for coords in lesion_coords)
 
-                    # if center_point_bl is None:
-                    #     center_point_bl = data_properties.get('patch_crop_info', {}).get('center_point', None)
-                    #     bl_seg = np.zeros_like(bl_data)-1  # no lesion in baseline
+                    if center_point_bl is None:
+                        center_point_bl = data_properties.get('patch_crop_info', {}).get('center_point', None)
+                        bl_seg = np.zeros_like(bl_data)-1  # no lesion in baseline
 
                     bl_data, bl_seg, bl_crop_info = self.crop_to_patch_size(bl_data, bl_seg, configuration_manager.patch_size, 
-                                                                            center_point_bl)
+                                                                            center_point_bl, shift=crop_info['shift'])
+
                     bl_data_properties['patch_crop_info'] = bl_crop_info
                     bl_data_properties['shape_after_patch_cropping'] = bl_data.shape[1:]
             
@@ -278,7 +259,8 @@ class TrainingPreprocessor(object):
         return data, seg, data_properties, bl_data, bl_data_properties
 
     def crop_to_patch_size(self, data: np.ndarray, seg: Union[np.ndarray, None], 
-                          patch_size: Tuple[int, ...], center_point: Union[Tuple[int, ...], None] = None) -> Tuple[np.ndarray, Union[np.ndarray, None], dict]:
+                          patch_size: Tuple[int, ...], center_point: Union[Tuple[int, ...], None] = None, 
+                          shift: Union[int, None] = None) -> Tuple[np.ndarray, Union[np.ndarray, None], dict]:
         """
         Crop data and segmentation to a fixed patch size centered around a point.
         
@@ -312,7 +294,13 @@ class TrainingPreprocessor(object):
             half_patch = patch_dim // 2
 
             # randomly shift center by 50% of patch size
+            if shift is None:
+                shift = int(0.5 * patch_dim)
+                if shift > 0:
+                    shift = np.random.randint(-shift, shift + 1)
             
+            center += shift
+
             start = max(0, center - half_patch)
             end = min(orig_dim, center + half_patch + (patch_dim % 2))
 
@@ -360,6 +348,7 @@ class TrainingPreprocessor(object):
             'pad_before': pad_before,
             'pad_after': pad_after,
             'final_shape': cropped_data.shape[1:],
+            'shift': shift
         }
         
         if self.verbose:

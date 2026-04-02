@@ -28,8 +28,14 @@ class LesionLocatorTrainerTrack():
             deep_supervision=enable_deep_supervision)
         
         # Registration
+        # during inference resampling to the same spacing as the training data will be done, so we can use the same patch size as the training data for the registration network. During training, we will crop around the lesion and resample to a fixed spacing, so the input to the registration network will be larger than the patch size used for training the segmentation network. We can set a minimum size for the registration network input to ensure it can capture enough context for registration.
+        # reg_input_shape = [1, 1,
+        #     max(64, int(patch_size[0] * 1.5)),   # Z: 64 is enough for most cases
+        #     max(128, int(patch_size[1] * 1.5)),  # Y: 128 is standard minimum
+        #     max(128, int(patch_size[2] * 1.5))   # X: 128 is standard minimum
+        # ]
         reg_input_shape = [1, 1, 175, 175, 175]
         reg_net = make_network(reg_input_shape, include_last_step=True)
-        # reg_net = get_unigradicon() # Also loads pre-trained weights, for training
 
+        # reg_net = get_unigradicon() # Also loads pre-trained weights, for training
         return TrackNet(reg_net, reg_input_shape[2:], unet, unet_patch_size=patch_size)

@@ -146,6 +146,7 @@ class DefaultPreprocessor(object):
                     candidate_tp0 = [imf.replace('TP2', 'TP0') for imf in image_files]
                     if self.all_exist(candidate_tp0):
                         bl_files = candidate_tp0
+        
         # if possible, load seg
         if seg_file is not None:
             seg, _ = rw.read_seg(seg_file)
@@ -164,6 +165,7 @@ class DefaultPreprocessor(object):
             bl_seg = None
             bl_data, bl_seg, bl_data_properties = self.run_case_npy(bl_data, bl_seg, bl_data_properties, plans_manager, configuration_manager,
                                       dataset_json)
+
         return data, seg, data_properties, bl_data, bl_data_properties
 
 

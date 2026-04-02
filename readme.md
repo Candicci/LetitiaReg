@@ -80,6 +80,10 @@ LesionLocator_track
 ```bash
 LesionLocator_track -i /scratch/nnUNet_raw/Dataset801_USZMelanoma/imagesTr -p /scratch/nnUNet_raw/Dataset801_USZMelanoma/labelsTr -m /scratch/LesionLocatorckpt/LesionLocatorCheckpoint -o /home/katircio/code/LesionLocator/Seg801 -t "point" -npp 2 -nps 2 --visualize --modality "ct" 
 ```
+
+```bash
+LesionLocator_track -i /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr -p /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr -m /scratch/LesionLocator_saved_ckpt/TrainSeg900_LesionLocatorFTDec -o /home/xiachen/scripts/vis -t "point" -npp 2 -nps 2 --visualize --modality "pet" 
+```
 ---
 
 ### 2️⃣ Lesion Segmentation & Tracking Across Timepoints (Longitudinal)
@@ -100,6 +104,15 @@ LesionLocator_track
     --modality "ct"
     --visualize
     --adaptive_mode
+```
+
+```bash
+LesionLocator_track -i /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr -p /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr -m /scratch/LesionLocator_saved_ckpt/TrainSeg900_LesionLocatorFTDec -o /home/xiachen/scripts/vis_track -t "point" -npp 2 -nps 2 --visualize --modality "pet" --track 2>&1 | tee /home/xiachen/scripts/vis_track/eval_track.txt
+```
+
+# no finetune
+```bash
+LesionLocator_track -i /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr -p /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr -m /home/xiachen/scripts/ckpt/LesionLocatorCheckpoint -o /home/xiachen/scripts/vis_track_nft -t "point" -npp 2 -nps 2 --visualize --modality "pet" --track 2>&1 | tee /home/xiachen/scripts/vis_track_nft/eval_track.txt
 ```
 
 #### Arguments
@@ -172,6 +185,43 @@ To finetune encoder or decoder part of the LesionLocator segmentation model, you
 ```bash
 LesionLocator_train_segment -i /scratch/nnUNet_raw/Dataset800_USZMelanoma/imagesTr -iv /scratch/nnUNet_raw/Dataset801_USZMelanoma/imagesTr -p /scratch/nnUNet_raw/Dataset800_USZMelanoma/labelsTr -pv /scratch/nnUNet_raw/Dataset801_USZMelanoma/labelsTr -m /scratch/LesionLocatorckpt/LesionLocatorCheckpoint -o /home/katircio/code/LETITIA-LesionTracking/TrainSeg800_FTDec --ckpt_path  /scratch/LesionLocatorckpt/LesionLocatorFTDec -t "point" -npp 3 -nps 3 --visualize --modality "ct" --finetune decoder
 ```
+
+To fine-tune with PET images 
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+LesionLocator_train_segment -i /scratch/nnUNet_raw/Dataset900_USZMelanoma/imagesTr -iv /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr -p /scratch/nnUNet_raw/Dataset900_USZMelanoma/labelsTr -pv /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr -m /scratch/LesionLocator_saved_ckpt/TrainSeg900_LesionLocatorFTDec -o /home/xiachen/scripts/ckpt/TrainSeg900_FTDec --ckpt_path  /scratch/LesionLocator_saved_ckpt/TrainSeg900_LesionLocatorFTDec -t "point" -npp 1 -nps 1 --visualize --modality "pet" --finetune decoder --epoch 10 --batch_size 1 --num_workers 1
+```
+
+Test: fine-tune tracknet 
+```bash
+LesionLocator_train_track \
+    -bl /scratch/nnUNet_raw/Dataset900_USZMelanoma/imagesTr/TP0* \
+    -fu /scratch/nnUNet_raw/Dataset900_USZMelanoma/imagesTr/TP1* \
+    -pbl /scratch/nnUNet_raw/Dataset900_USZMelanoma/labelsTr/TP0* \
+    -pfu /scratch/nnUNet_raw/Dataset900_USZMelanoma/labelsTr/TP1* \
+    -tbl /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr/TP0* \
+    -tfu /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr/TP1* \
+    -tpbl /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr/TP0* \
+    -tpfu /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr/TP1* \
+    -o /home/xiachen/scripts/ckpt/TrainTrack900_FTDec \
+    -t point \
+    -m /scratch/LesionLocator_saved_ckpt/TrainSeg900_LesionLocatorFTDec \
+    -f 0 1 2 3 4 \
+    --modality pet \
+    --epochs 5 \
+    --batch_size 1 \
+    --num_workers 1 \
+    --finetune unet \
+    --train_fold 0 \
+    --ckpt_path /home/xiachen/scripts/ckpt/inference_checkpoints
+    -npp 1 \
+    -nps 1 \
+    -device cuda \
+    --visualize \
+    --verbose 2>&1 | tee /home/xiachen/scripts/train_track_output_fold_0.txt
+```
+
 ---
 
 ## 📚 Citation

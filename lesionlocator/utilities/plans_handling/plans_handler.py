@@ -255,12 +255,21 @@ class PlansManager(object):
             base_config = self._internal_resolve_configuration_inheritance(parent_config_name, visited, modality)
             base_config.update(configuration)
             configuration = base_config
-            if modality == 'pet':
-                #configuration['normalization_schemes'] = ['ZScoreNormalization']
-                #configuration['normalization_schemes'] = ['CTNormalization']
-                configuration['normalization_schemes'] = ['NoNormalization']
+        if modality == 'pet':
+            configuration['normalization_schemes'] = ['ZScoreNormalization']
+            configuration['use_mask_for_norm'] = [True]
+            configuration['spacing'] = [3.3, 3.3, 3.3]
+            configuration['median_image_size_in_voxels'] = [395, 256, 256]
+            # configuration['patch_size'] = [96, 128, 128]
+            configuration['patch_size'] = [256, 192, 192]
 
-            configuration['spacing'] = [1.5, 1.5, 1.5] 
+
+        if modality == 'ct':
+            configuration['normalization_schemes'] = ['CTNormalization']
+            configuration['spacing'] = [3.30, 1.75, 1.75] # [3.30, 1.25, 1.25]
+            configuration['median_image_size_in_voxels'] = [371, 512, 512]
+            configuration['patch_size'] = [256, 256, 256]
+            # configuration['patch_size'] = [96, 256, 256]
         return configuration
 
     @lru_cache(maxsize=10)

@@ -23,7 +23,10 @@ def sparse_to_dense_prompt(prompt, prompt_type, array):
         assert not any(np.isnan(prompt)), "Point contains NaNs, got {}".format(prompt)
         centroid = np.round(prompt).astype(int)
         b = ball(5, strict_radius=False)
-        ball_mask = np.zeros_like(array[0])
+        _array = array[0]
+        if _array.is_cuda:
+            _array = _array.cpu()
+        ball_mask = np.zeros_like(_array.numpy())
         xmin_img = max(0, centroid[0]-5)
         xmax_img = min(ball_mask.shape[0], centroid[0]+6)
         ymin_img = max(0, centroid[1]-5)
@@ -38,7 +41,7 @@ def sparse_to_dense_prompt(prompt, prompt_type, array):
         zmax_ball = 5 + (zmax_img - centroid[2])
         ball_mask[xmin_img:xmax_img, ymin_img:ymax_img, zmin_img:zmax_img] = b[xmin_ball:xmax_ball, ymin_ball:ymax_ball, zmin_ball:zmax_ball]
         ball_mask = torch.from_numpy(ball_mask).to(array.dtype).unsqueeze_(0)
-        return ball_mask
+        return ball_mask.to(array.device)
     else:
         raise ValueError(f"Unknown prompt type {prompt_type}")
 

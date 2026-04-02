@@ -3,7 +3,64 @@ from typing import Type
 
 import numpy as np
 from numpy import number
+from scipy import ndimage as ndi
 
+def get_pet_foreground(pet, thresh=None, pct=95):
+    """
+    Simple PET foreground mask.
+    Foreground = voxels above the 95th percentile of the image (adaptive).
+    """
+
+    # threshold relative to PET intensity distribution
+    if thresh is None:
+        thr = np.percentile(pet[pet > 0], pct)
+    else:
+        thr = thresh
+
+    # foreground is everything above threshold
+    mask = pet > thr
+
+    # largest connected component
+    labels, n = ndi.label(mask)
+    if n > 0:
+        sizes = ndi.sum(mask, labels, index=range(1, n+1))
+        largest = np.argmax(sizes) + 1
+        mask = (labels == largest)
+
+    # optional hole filling
+    mask = ndi.binary_fill_holes(mask)
+    
+    return mask
+
+def get_ct_foreground(ct, hu_threshold=-900):
+    """
+    Returns a simple foreground mask for CT.
+    Foreground = everything > -500 HU, cleaned.
+    """
+
+    # threshold to remove air/background (air is around -1000 HU)
+    # Use a more conservative threshold to avoid creating holes
+    mask = ct > hu_threshold
+
+    # morphological closing to fill small holes before connected components
+    from scipy.ndimage import binary_closing, binary_dilation
+    struct = np.ones((3, 3, 3))
+    mask = binary_closing(mask, structure=struct, iterations=2)
+
+    # keep largest connected component
+    labels, n = ndi.label(mask)
+    if n > 0:
+        sizes = ndi.sum(mask, labels, index=range(1, n+1))
+        largest = np.argmax(sizes) + 1
+        mask = (labels == largest)
+
+    # fill remaining holes in the largest component
+    mask = ndi.binary_fill_holes(mask)
+    
+    # slight dilation to ensure we don't cut off edges
+    mask = binary_dilation(mask, structure=struct, iterations=1)
+
+    return mask
 
 class ImageNormalization(ABC):
     leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = None
@@ -38,15 +95,19 @@ class ZScoreNormalization(ImageNormalization):
             # in BraTS). We want to run the normalization only in the brain region, so we need to mask the image.
             # The default nnU-net sets use_mask_for_norm to True if cropping to the nonzero region substantially
             # reduced the image size.
-            mask = seg >= 0
+            #mask = seg >= 0
+            mask = get_pet_foreground(image, thresh=0.03)
             mean = image[mask].mean()
             std = image[mask].std()
             image[mask] = (image[mask] - mean) / (max(std, 1e-8))
+            image[~mask] = 0
         else:
             mean = image.mean()
             std = image.std()
             image -= mean
             image /= (max(std, 1e-8))
+
+        
         return image
 
 
@@ -55,13 +116,16 @@ class CTNormalization(ImageNormalization):
 
     def run(self, image: np.ndarray, seg: np.ndarray = None) -> np.ndarray:
         assert self.intensityproperties is not None, "CTNormalization requires intensity properties"
+        # mask = get_ct_foreground(image)
         mean_intensity = self.intensityproperties['mean']
         std_intensity = self.intensityproperties['std']
         lower_bound = self.intensityproperties['percentile_00_5']
         upper_bound = self.intensityproperties['percentile_99_5']
-
+        # print(f"CT Normalization: mean={mean_intensity}, std={std_intensity}, "
+        #       f"0.5th percentile={lower_bound}, 99.5th percentile={upper_bound}", flush=True)
+        # print(f"image min={image.min()}, max={image.max()}", flush=True)
         image = image.astype(self.target_dtype, copy=False)
-        np.clip(image, lower_bound, upper_bound, out=image)
+        # np.clip(image, lower_bound, upper_bound, out=image)
         image -= mean_intensity
         image /= max(std_intensity, 1e-8)
         return image

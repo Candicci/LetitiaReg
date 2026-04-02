@@ -6,18 +6,17 @@ import gc
 import traceback
 import json
 import time
+import glob
 import numpy as np
 from queue import Queue
 from threading import Thread
 from time import sleep
 from typing import Tuple, Union, List
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, IterableDataset
-import json
 import SimpleITK
 from matplotlib import pyplot as plt
 from sklearn.model_selection import KFold
@@ -45,6 +44,7 @@ from lesionlocator.utilities.surface_distance_based_measures import compute_surf
 
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
+import gc
 
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -68,8 +68,12 @@ def dice_loss(pred, target, epsilon=1e-6):
     intersection = torch.sum(pred_soft * target_onehot, dims)
     union = torch.sum(pred_soft, dims) + torch.sum(target_onehot, dims)
     dice = (2. * intersection + epsilon) / (union + epsilon)
+    weighted_dice = 0.1 * dice[0] + 0.9 * dice[1]
+
+    print(f"prediction is all zeros: {torch.all(pred_soft == 0)}")
+    print(f"dice score {dice}")
     
-    return 1 - dice.mean()
+    return 1 - weighted_dice
 
 def unique_ids_to_indices(id_to_indices, unique_ids):
     indices = []
@@ -162,7 +166,7 @@ class LesionDatasetWrapper(IterableDataset):
     """
     def __init__(self, input_files, prompt_files, output_files, prompt_type, 
                  plans_config, dataset_json, configuration_config, modality,
-                 num_processes=3, pin_memory=False, verbose=False, track=False):
+                 num_processes=8, pin_memory=False, verbose=False, track=False):
         self.input_files = input_files
         self.prompt_files = prompt_files
         self.output_files = output_files
@@ -182,21 +186,37 @@ class LesionDatasetWrapper(IterableDataset):
         This is an approximation since the actual number of lesions per file varies.
         """
         # Estimate: assume average of 2-3 lesions per file
-        return len(self.input_files) * 2
+        return len(self.input_files) 
         
     def __iter__(self):
         """
         Create the multiprocessing data iterator and yield training samples.
         This preserves the existing preprocessing pipeline completely.
         """
+
+        if len(self.input_files) == len(self.prompt_files) == len(self.output_files):
+            perm = np.random.permutation(len(self.input_files))
+            input_files = [self.input_files[i] for i in perm]
+            prompt_files = [self.prompt_files[i] for i in perm]
+            output_files = [self.output_files[i] for i in perm]
+        else:
+            input_files = self.input_files
+            prompt_files = self.prompt_files
+            output_files = self.output_files
+
+        data_iterator = preprocessing_iterator_fromfiles(
+            input_files, prompt_files, output_files,
+            self.prompt_type, self.plans_config, self.dataset_json,
+            self.configuration_config, self.modality, self.num_processes, self.pin_memory,
+            self.verbose, self.track, train=True
+        )
+
         data_iterator = preprocessing_iterator_fromfiles(
             self.input_files, self.prompt_files, self.output_files,
             self.prompt_type, self.plans_config, self.dataset_json,
             self.configuration_config, self.modality, self.num_processes, self.pin_memory,
-            self.verbose, self.track
+            self.verbose, self.track, train=True
         )
-
-        print('Data iterator created, yielding training samples...')
 
         for preprocessed in data_iterator:
             data = preprocessed['data']
@@ -204,6 +224,13 @@ class LesionDatasetWrapper(IterableDataset):
             seg_mask = preprocessed['seg']
             properties = preprocessed['data_properties']
 
+            if self.track:
+                bl_data = preprocessed['bl_data']
+
+            if self.track and bl_data is None:
+                # go to the next sample if no baseline data
+                continue
+                            
             # Convert each lesion instance into a training sample
             for inst_id, p in enumerate(prompt):
                 # print(f'Processing instance {inst_id}', flush=True)
@@ -216,6 +243,12 @@ class LesionDatasetWrapper(IterableDataset):
                 gt_mask = (seg_mask == mask_id).astype(np.uint8)
                 p_dense = sparse_to_dense_prompt(p, self.prompt_type, array=data)
 
+                if self.track:
+                    bl_seg = preprocessed['bl_data_properties'].get('seg', None)
+                    bl_gt_mask = (bl_seg == mask_id).astype(np.uint8) if bl_seg is not None else None
+
+                if self.track and (bl_gt_mask == 0).all():
+                    continue
                 # if len(p) == 0:
                 #     continue
                 # mask_id += 1
@@ -244,14 +277,36 @@ class LesionDatasetWrapper(IterableDataset):
                 else:
                     target_tensor = torch.from_numpy(gt_mask[0]).long()
                 
-                yield {
-                    'data': data_tensor,                    # Input image [C, H, W, D]
-                    'prompt': prompt_tensor,               # Dense prompt [1, H, W, D]
-                    'target': target_tensor,               # Ground truth [H, W, D]
-                    'properties': properties,               # Metadata
-                    'lesion_id': mask_id,                  # Lesion instance ID
-                    'filename': preprocessed['ofile']      # Original filename
-                }
+                if self.track:
+                    if isinstance(bl_data, torch.Tensor):
+                        bl_data_tensor = bl_data.float()
+                    else:
+                        bl_data_tensor = torch.from_numpy(bl_data).float()
+                    
+                    #if bl_gt_mask is not None:
+                    if isinstance(bl_gt_mask, torch.Tensor):
+                        bl_target_tensor = bl_gt_mask.float()
+                    else:
+                        bl_target_tensor = torch.from_numpy(bl_gt_mask).float()
+                    
+                    yield {
+                        'bl_data': bl_data_tensor, 
+                        'fu_data': data_tensor,
+                        'bl_prompt': bl_target_tensor,
+                        'target': target_tensor,
+                        'properties': properties,
+                        'lesion_id': mask_id,                  # Lesion instance ID
+                        'filename': preprocessed['ofile']      # Original filename
+                    }
+                else:    
+                    yield {
+                        'data': data_tensor,                    # Input image [C, H, W, D]
+                        'prompt': prompt_tensor,               # Dense prompt [1, H, W, D]
+                        'target': target_tensor,               # Ground truth [H, W, D]
+                        'properties': properties,               # Metadata
+                        'lesion_id': mask_id,                  # Lesion instance ID
+                        'filename': preprocessed['ofile']      # Original filename
+                    }
 
 
 def training_collate_fn(batch):
@@ -277,42 +332,44 @@ def training_collate_fn(batch):
             collated[key] = values
     return collated
 
-def prev_training_collate_fn(batch):
+
+def tracking_collate_fn(batch):
     """
-    Custom collate function for batching training samples.
-    Now supports true batching with fixed patch sizes from TrainingPreprocessor.
+    Custom collate function for tracking training samples.
+    Handles baseline data, follow-up data, baseline prompt, and target.
     """
     if len(batch) == 1:
         return batch[0]
     
     # Stack all batch items into proper tensors
-    batch_data = []
+    batch_baseline = []
+    batch_followup = []
     batch_prompts = []
     batch_targets = []
     batch_properties = []
     batch_lesion_ids = []
     batch_filenames = []
 
-    start_time = time.time()
     for item in batch:
-        batch_data.append(item['data'])
-        batch_prompts.append(item['prompt'])
+        batch_baseline.append(item['bl_data'])
+        batch_followup.append(item['fu_data'])
+        batch_prompts.append(item['bl_prompt'])
         batch_targets.append(item['target'])
         batch_properties.append(item['properties'])
         batch_lesion_ids.append(item['lesion_id'])
         batch_filenames.append(item['filename'])
     
-    # Stack tensors - all should have same dimensions due to crop_to_patch_size
+    # Stack tensors - all should have same dimensions due to preprocessing
     try:
-        stacked_data = torch.stack(batch_data, dim=0)       # [B, C, H, W, D]
-        stacked_prompts = torch.stack(batch_prompts, dim=0) # [B, 1, H, W, D]
-        stacked_targets = torch.stack(batch_targets, dim=0) # [B, H, W, D]
+        stacked_baseline = torch.stack(batch_baseline, dim=0)       # [B, C, H, W, D]
+        stacked_followup = torch.stack(batch_followup, dim=0)       # [B, C, H, W, D]
+        stacked_prompts = torch.stack(batch_prompts, dim=0)         # [B, 1, H, W, D]
+        stacked_targets = torch.stack(batch_targets, dim=0)         # [B, H, W, D]
         
-        end_time = time.time()
-        print(f'Batch stacked in {end_time - start_time:.4f} seconds')
         return {
-            'data': stacked_data,
-            'prompt': stacked_prompts,
+            'bl_data': stacked_baseline,
+            'fu_data': stacked_followup,
+            'bl_prompt': stacked_prompts,
             'target': stacked_targets,
             'properties': batch_properties,
             'lesion_id': batch_lesion_ids,
@@ -321,16 +378,18 @@ def prev_training_collate_fn(batch):
 
     except RuntimeError as e:
         # Print shapes for debugging
-        print(f"Batch stacking failed: {e}")
-        print(f"Data shapes: {[d.shape for d in batch_data]}")
+        print(f"Tracking batch stacking failed: {e}")
+        print(f"Baseline shapes: {[d.shape for d in batch_baseline]}")
+        print(f"Follow-up shapes: {[d.shape for d in batch_followup]}")
         print(f"Prompt shapes: {[p.shape for p in batch_prompts]}")
         print(f"Target shapes: {[t.shape for t in batch_targets]}")
-        # Fallback: if shapes don't match, process as batch_size=1
-        print(f"Warning: Could not stack batch, falling back to single sample processing")
+        # Fallback: process as batch_size=1
+        print(f"Warning: Could not stack tracking batch, falling back to single sample processing")
         return batch[0]
 
 
-class LesionLocatorSegmenter(object):
+
+class LesionLocatorTrack(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
@@ -341,7 +400,6 @@ class LesionLocatorSegmenter(object):
                  verbose_preprocessing: bool = False,
                  allow_tqdm: bool = True,
                  visualize: bool = False,
-                 track: bool = False,
                  adaptive_mode: bool = False):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
@@ -369,83 +427,128 @@ class LesionLocatorSegmenter(object):
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
         self.visualize = visualize
-        self.track = track
         self.adaptive_mode = adaptive_mode
         
-        print('Tracking: ', self.track)
         print('Adaptive mode: ', self.adaptive_mode)
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              model_track_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              modality: str = 'ct',
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.pth',
+                                             reinit: bool = False):
         """
         This is used when making predictions with a trained model
         """
-        print("Loading segmentation model.")
+        print("Loading tracking model")
+        # print("Loading segmentation model.")
         if use_folds is None:
             use_folds = LesionLocatorSegmenter.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
         dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
+        self.dataset_json = dataset_json
+        
         plans = load_json(join(model_training_output_dir, 'plans.json'))
         self.plans = plans
+        self.modality = modality
+        
         plans_manager = PlansManager(plans)
+        
+        # Debug: Print plans structure for troubleshooting
+        print("Plans structure debug:")
+        print(f"  Plans type: {type(plans)}")
+        print(f"  Plans keys: {list(plans.keys()) if isinstance(plans, dict) else 'Not a dict'}")
+        if isinstance(plans, dict) and 'configurations' in plans:
+            print(f"  Available configurations: {list(plans['configurations'].keys())}")
+        else:
+            print("  No 'configurations' key found in plans")
 
         if isinstance(use_folds, str):
-            use_folds = [use_folds]
+             use_folds = [use_folds]
 
-        parameters = []
-        for i, f in enumerate(use_folds):
-            f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'), weights_only=False)
-            if i == 0:
-                trainer_name = checkpoint['trainer_name']
-                configuration_name = checkpoint['init_args']['configuration']
-                inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
-                    'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+        # parameters = []
+        # for i, f in enumerate(use_folds):
+        #     f = int(f) if f != 'all' else f
+        #     checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
+        #                             map_location=torch.device('cpu'), weights_only=False)
+        #     if i == 0:
+        #         trainer_name = checkpoint['trainer_name']
+        #         configuration_name = checkpoint['init_args']['configuration']
+                
+        #         # Enhanced configuration mapping for better compatibility
+        #         original_config = configuration_name
+        #         if configuration_name == '3d_fullres_bs3':
+        #             configuration_name = '3d_fullres'
+        #             print(f"Warning: Mapped {original_config} to {configuration_name}")
+        #         elif configuration_name not in plans_manager.plans.get('configurations', {}):
+        #             # Try common fallback mappings
+        #             fallback_mappings = {
+        #                 '3d_fullres_bs2': '3d_fullres',
+        #                 '3d_fullres_bs4': '3d_fullres', 
+        #                 '3d_fullres_bs8': '3d_fullres',
+        #                 '3d_lowres': '3d_fullres',
+        #                 '2d_bs3': '2d',
+        #                 '2d_bs2': '2d'
+        #             }
+        #             if configuration_name in fallback_mappings:
+        #                 new_config = fallback_mappings[configuration_name]
+        #                 if new_config in plans_manager.plans.get('configurations', {}):
+        #                     configuration_name = new_config
+        #                     print(f"Warning: Mapped {original_config} to {configuration_name}")
+        #                 else:
+        #                     print(f"Error: Neither {original_config} nor {new_config} found in plans")
+        #                     print(f"Available configurations: {list(plans_manager.plans.get('configurations', {}).keys())}")
+        #             else:
+        #                 print(f"Error: Configuration {configuration_name} not found in plans")
+        #                 print(f"Available configurations: {list(plans_manager.plans.get('configurations', {}).keys())}")
+                
+        #         inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
+        #             'inference_allowed_mirroring_axes' in checkpoint.keys() else None
 
-            parameters.append(checkpoint['network_weights'])
+        #     # load previous fine-tuned model
+        #     if os.path.exists(join(model_training_output_dir, f'fold_{f}', 'best_model.pth')):
+        #         print(f'Loading fold {f} best model for segmentation')
+        #         checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', 'best_model.pth'),
+        #                     map_location=torch.device('cpu'), weights_only=False)
 
-        self.configuration_name = configuration_name
-        self.modality = modality
-        configuration_manager = plans_manager.get_configuration(configuration_name, modality=modality)
-        configuration_manager.set_preprocessor_name('TrainingPreprocessor')
+        #     parameters.append(checkpoint['network_weights'])
 
-        # restore network
-        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(lesionlocator.__path__[0], "training", "LesionLocatorTrainer"),
-                                                    trainer_name, 'lesionlocator.training.LesionLocatorTrainer')
-        if trainer_class is None:
-            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in lesionlocator.training.LesionLocatorTrainer. '
-                               f'Please place it there (in any .py file)!')
-        network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
-        )
+        # # self.configuration_name = configuration_name
+        # configuration_manager = plans_manager.get_configuration(configuration_name, modality=modality)
+        # configuration_manager.set_preprocessor_name('TrainingPreprocessor')
 
-        self.plans_manager = plans_manager
-        self.configuration_manager = configuration_manager
-        self.list_of_parameters = parameters
+        # # restore network
+        # num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
+        # trainer_class = recursive_find_python_class(join(lesionlocator.__path__[0], "training", "LesionLocatorTrainer"),
+        #                                             trainer_name, 'lesionlocator.training.LesionLocatorTrainer')
+        # if trainer_class is None:
+        #     raise RuntimeError(f'Unable to locate trainer class {trainer_name} in lesionlocator.training.LesionLocatorTrainer. '
+        #                        f'Please place it there (in any .py file)!')
+        # network = trainer_class.build_network_architecture(
+        #     configuration_manager.network_arch_class_name,
+        #     configuration_manager.network_arch_init_kwargs,
+        #     configuration_manager.network_arch_init_kwargs_req_import,
+        #     num_input_channels,
+        #     plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+        #     enable_deep_supervision=False
+        # )
+
+        # self.plans_manager = plans_manager
+        # self.configuration_manager = configuration_manager
+        # self.list_of_parameters = parameters
         
-        # Store configuration name for checkpoint saving
-        self.configuration_name = configuration_name
+        # # Store configuration name for checkpoint saving
+        # self.configuration_name = configuration_name
 
-        network.load_state_dict(parameters[0])
+        # network.load_state_dict(parameters[0])
         
-        self.network = network
-        self.dataset_json = dataset_json
-        self.trainer_name = trainer_name
-        self.allowed_mirroring_axes = inference_allowed_mirroring_axes
-        self.label_manager = plans_manager.get_label_manager(dataset_json)
-        if ('LesionLocator_compile' in os.environ.keys()) and (os.environ['LesionLocator_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
-            self.network = torch.compile(self.network)
+        # self.network = network
+        # self.trainer_name = trainer_name
+        # self.allowed_mirroring_axes = inference_allowed_mirroring_axes
+        # self.label_manager = plans_manager.get_label_manager(dataset_json)
+        # if ('LesionLocator_compile' in os.environ.keys()) and (os.environ['LesionLocator_compile'].lower() in ('true', '1', 't')) \
+        #         and not isinstance(self.network, OptimizedModule):
+        #     print('Using torch.compile')
+        #     self.network = torch.compile(self.network)
 
         #Tracker network
         dataset_json_tracker = load_json(join(model_track_training_output_dir, 'dataset.json'))
@@ -458,18 +561,35 @@ class LesionLocatorSegmenter(object):
             f = int(f) if f != 'all' else f
             checkpoint_tracker = torch.load(join(model_track_training_output_dir, f'fold_{f}', "checkpoint_final.pth"),
                                     map_location=torch.device('cpu'), weights_only=False)
+
             if i == 0:
                 trainer_name_tracker = checkpoint_tracker['trainer_name']
                 configuration_name_tracker = checkpoint_tracker['init_args']['configuration']
                 inference_allowed_mirroring_axes = checkpoint_tracker['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint_tracker.keys() else None
 
+            # resume from a previous tracking model, 
+            # TODO: update the final_checkpoint with the new tracking model
+            if os.path.exists(join(model_track_training_output_dir, f'fold_{f}', 'best_tracking_model.pth')):
+                print(f'Loading fold {f} best tracking model')
+                checkpoint_tracker = torch.load(join(model_track_training_output_dir, f'fold_{f}', 'best_tracking_model.pth'),
+                            map_location=torch.device('cpu'), weights_only=False)
+            
+            # load segmentation decoder for the tracker
+            # for key in checkpoint_tracker['network_weights'].keys():
+            #     if 'unet.decoder' in key:
+            #         seg_key = key.replace('unet.', '')
+            #         if seg_key in checkpoint['network_weights'].keys():
+            #             checkpoint_tracker['network_weights'][key] = checkpoint['network_weights'][seg_key]
+            #         else:
+            #             print(f'Key {key} not in tracker network, skipping loading segmentation weights for it')
+
             parameters_tracker.append(checkpoint_tracker['network_weights'])
 
-        configuration_manager_tracker = plans_manager_tracker.get_configuration(configuration_name_tracker)
+        configuration_manager_tracker = plans_manager_tracker.get_configuration(configuration_name_tracker, modality=modality)
         # set spacing
-        configuration_manager.set_spacing([1.5, 1.5, 1.5])
-        configuration_manager_tracker.set_spacing([1.5, 1.5, 1.5])
+        # configuration_manager_tracker.set_spacing([3.3, 2.7, 2.7])
+        self.configuration_name_tracker = configuration_name_tracker
         # restore networks
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager_tracker, dataset_json_tracker)
         trainer_class = recursive_find_python_class(join(lesionlocator.__path__[0], "training", "LesionLocatorTrainer"),
@@ -478,12 +598,12 @@ class LesionLocatorSegmenter(object):
             raise RuntimeError(f'Unable to locate trainer class {trainer_name_tracker} in lesionlocator.training.LesionLocatorTrainer. '
                                f'Please place it there (in any .py file)!')
         network_tracker = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
+            configuration_manager_tracker.network_arch_class_name,
+            configuration_manager_tracker.network_arch_init_kwargs,
+            configuration_manager_tracker.network_arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            configuration_manager.patch_size,
+            configuration_manager_tracker.patch_size,
             enable_deep_supervision=False
         )
        
@@ -491,7 +611,9 @@ class LesionLocatorSegmenter(object):
         self.configuration_manager_tracker = configuration_manager_tracker
         self.list_of_parameters_tracker = parameters_tracker
 
-        network_tracker.load_state_dict(parameters_tracker[0])
+        if not reinit:
+            network_tracker.load_state_dict(parameters_tracker[0])
+
         self.network_tracker = network_tracker
         self.dataset_json_tracker = dataset_json_tracker
         self.trainer_name_tracker = trainer_name_tracker
@@ -500,9 +622,8 @@ class LesionLocatorSegmenter(object):
         self.tile_step_size = 0.5
         self.use_gaussian = True
         self.use_mirroring = True
-        self.target_spacing = self.configuration_manager.spacing
-        if self.track:
-            self.target_spacing = self.configuration_manager_tracker.spacing
+        # For LesionLocatorTrack, always use tracker spacing
+        self.target_spacing = self.configuration_manager_tracker.spacing
         print('Using target spacing: ', self.target_spacing)
         print('Segmentation configuration: ', self.configuration_manager)
         print('Tracking configuration: ', self.configuration_manager_tracker)
@@ -516,445 +637,6 @@ class LesionLocatorSegmenter(object):
         use_folds = [int(i.split('_')[-1]) for i in fold_folders]
         print(f'found the following folds: {use_folds}')
         return use_folds
-
-
-    def predict_from_files(self,
-                           source_folder_or_file: str,
-                           output_folder_or_file: str,
-                           prompt_folder_or_file: str,
-                           prompt_type: str,
-                           overwrite: bool = True,
-                           num_processes_preprocessing: int = default_num_processes,
-                           num_processes_segmentation_export: int = default_num_processes,
-                           num_parts: int = 1,
-                           part_id: int = 0):
-        """
-        This is the default function for making predictions. It works best for batch predictions
-        (predicting many images at once).
-        """
-        assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
-                                      "So if there are 3 parts then valid part IDs are 0, 1, 2")
-        if os.path.isdir(source_folder_or_file):
-            assert os.path.isdir(output_folder_or_file) and os.path.isdir(prompt_folder_or_file), \
-                "If '-i' is a folder then '-o' (output) and '-p' (prompt) must also be folders."
-            # list and sort all the files
-            input_files = subfiles(source_folder_or_file, suffix=self.dataset_json['file_ending'], join=True, sort=True)
-            prompt_files_json = subfiles(prompt_folder_or_file, suffix='.json', join=True, sort=True)
-            prompt_files_mask = subfiles(prompt_folder_or_file, suffix=self.dataset_json['file_ending'], join=True, sort=True)
-            output_files = [join(output_folder_or_file, os.path.basename(i)) for i in input_files]
-            
-            # Assertions
-            if len(input_files) == 0:
-                print(f'No files found in {source_folder_or_file}')
-                return
-            assert len(prompt_files_json) == 0 or len(prompt_files_mask) == 0, \
-                "Prompt folder must contain either json files or mask files, not both."
-            assert len(input_files) == len(prompt_files_json) or len(input_files) == len(prompt_files_mask), \
-                "Number of files in source folder and prompt folder must be the same."
-            
-            prompt_files = prompt_files_json if len(prompt_files_json) > 0 else prompt_files_mask
-            
-            # Check if the output folder exists
-            if not os.path.isdir(output_folder_or_file):
-                os.makedirs(output_folder_or_file)
-            else:
-                if not overwrite:
-                    # Remove already predicted files from the lists
-                    existing_files = [os.path.isfile(i) for i in output_files]
-                    not_existing_indices = [i for i, j in enumerate(input_files) if j not in existing_files]
-                    input_files = [input_files[i] for i in not_existing_indices]
-                    prompt_files = [prompt_files[i] for i in not_existing_indices]
-                    output_files = [output_files[i] for i in not_existing_indices]
-        else:
-            assert not os.path.isdir(prompt_folder_or_file), \
-                "If '-i' is a file then '-p' (prompt) must also be files not folders."
-            input_files = [source_folder_or_file]
-            prompt_files = [prompt_folder_or_file]
-            output_files = [join(output_folder_or_file, os.path.basename(source_folder_or_file))]
-
-        # Truncate output files
-        output_files = [i.replace(self.dataset_json['file_ending'], '') for i in output_files]
-        data_iterator = preprocessing_iterator_fromfiles(input_files, prompt_files,
-                                                output_files, prompt_type, self.plans_manager, self.dataset_json,
-                                                self.configuration_manager, num_processes_preprocessing, self.device.type == 'cuda',
-                                                self.verbose_preprocessing, self.track)
-       
-        return self.predict_from_data_iterator(data_iterator, prompt_type, output_folder_or_file, num_processes_segmentation_export)
-
-
-    def predict_from_data_iterator(self,
-                                   data_iterator,
-                                   prompt_type: str,
-                                   output_folder_or_file: str,
-                                   num_processes_segmentation_export: int = default_num_processes):
-        """
-        This function takes a data iterator and makes predictions and saves each instance (lesion) as a separate file.
-        """
-        with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
-            worker_list = [i for i in export_pool._pool]
-            r = []
-            error_all={'dice': {'mean':0, 'TP0':{'all':[], 'mean':0}, 'TP1': {'all':[], 'mean':0}, 'TP2': {'all':[], 'mean':0}}, 
-               'nsd': {'mean':0, 'TP0':{'all':[], 'mean':0}, 'TP1': {'all':[], 'mean':0}, 'TP2': {'all':[], 'mean':0}},
-               'hausdorff': {'mean':0, 'TP0':{'all':[], 'mean':0}, 'TP1': {'all':[], 'mean':0}, 'TP2': {'all':[], 'mean':0}},
-               'lesion_found':{'all':0, 'mean':0, 'TP0':{'all':0, 'mean':0}, 'TP1':{'all':0, 'mean':0}, 'TP2':{'all':0, 'mean':0}},
-               'lesion_all': {'all':0, 'TP0':{'all':0}, 'TP1':{'all':0}, 'TP2':{'all':0}}}
-            dice_score_all = []
-            hausdorff_score_all = []
-            nsd_score_all = []
-            metrics = {
-                'dice': 0.0,
-                'hausdorff': 0.0,
-                'nsd': 0.0
-            }
-            for preprocessed in data_iterator:
-                data = preprocessed['data']
-                #baseline data, None for TP0 scans
-                bl_data = preprocessed['bl_data']
-                if isinstance(data, str):
-                    delfile = data
-                    data = torch.from_numpy(np.load(data))
-                    os.remove(delfile)
-                ofile = preprocessed['ofile']
-                print(f'\n === Predicting {os.path.basename(ofile)} === ')
-                patient_tp = os.path.basename(ofile)
-                timepoint = os.path.basename(ofile).split('_')[0]
-                properties = preprocessed['data_properties']
-                prompt = preprocessed['prompt']
-                seg_mask = preprocessed['seg']
-                # let's not get into a runaway situation where the GPU predicts so fast that the disk has to b swamped with files
-                proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
-                while not proceed:
-                    sleep(0.1)
-                    proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
-
-                if len(prompt) == 0:
-                    print(f" No prompt found for {os.path.basename(ofile)}")
-                else:
-                    for inst_id, p in enumerate(prompt):
-                        inst_id += 1
-                        gt_mask = ((seg_mask == inst_id).astype(np.uint8))
-                        if len(p) == 0:
-                            print(f"--- No prompt found for Lesion ID {inst_id} ---")
-                            continue                 
-                        print(f'\n Lesion ID {inst_id}: ')
-                        for k in error_all.keys():
-                            if k == 'lesion_all' or k == 'lesion_found':
-                                continue
-                            if os.path.basename(ofile) not in error_all[k].keys():
-                                error_all[k][patient_tp]={'mean':0, 'per_lesion':[]}
-                        p_sparse = p
-                        p = sparse_to_dense_prompt(p, prompt_type, array=data)
-                        if p is None:
-                            print(f" Invalid prompt found for {os.path.basename(ofile)}")
-                            continue
-                        #Check if there is an existing segmentation mask for the baseline image
-                        tp_order = ['TP2', 'TP1', 'TP0']
-                        current_tp = None
-                        for tp in tp_order:
-                            if tp in os.path.basename(ofile):
-                                current_tp = tp
-                                break
-
-                        prev_tp = None
-                        use_prev_tp = False
-                        low_score = False
-                        if current_tp == 'TP2':
-                            # Try TP1 first, then TP0
-                            for candidate in ['TP1', 'TP0']:
-                                prev_tp_candidate = os.path.basename(ofile).replace('TP2', candidate)
-                                if os.path.exists(os.path.join(output_folder_or_file, prev_tp_candidate + '_lesion_' + str(inst_id) + '.nii.gz')):
-                                    prev_tp = prev_tp_candidate
-                                    break
-                        elif current_tp == 'TP1':
-                            prev_tp_candidate = os.path.basename(ofile).replace('TP1', 'TP0')
-                            if os.path.exists(os.path.join(output_folder_or_file, prev_tp_candidate + '_lesion_' + str(inst_id) + '.nii.gz')):
-                                prev_tp = prev_tp_candidate
-                        
-                        if self.track and (prev_tp is not None):
-                            use_prev_tp = True
-                            prev_seg_sitk = SimpleITK.ReadImage(os.path.join(output_folder_or_file, prev_tp+'_lesion_'+str(inst_id)+'.nii.gz'))
-                            original_spacing = prev_seg_sitk.GetSpacing()[::-1]
-                            print('Reading segmentation mask with spacing: ', original_spacing, ', target spacing is: ', self.target_spacing)
-                            # Convert to numpy and compute new shape
-                            prev_seg_np = SimpleITK.GetArrayFromImage(prev_seg_sitk)
-                            new_shape = compute_new_shape(prev_seg_np.shape, original_spacing, self.target_spacing)
-                            bl_spacing = (prev_seg_np.shape[0]* original_spacing[0] /  bl_data.shape[1],
-                                        prev_seg_np.shape[1] * original_spacing[1] /  bl_data.shape[2],
-                                        prev_seg_np.shape[2] * original_spacing[2] /  bl_data.shape[3])
-                            #print('BL SPACING: ', bl_spacing)
-                            #print('New shape for resampling: ', new_shape)
-                            #print('BL DATA SHAPE FOR RESAMPLING: ', bl_data.shape)
-                            prev_seg_resampled = self.configuration_manager.resampling_fn_seg(
-                                prev_seg_np[None], 
-                                bl_data.shape[1:], 
-                                original_spacing, 
-                                bl_spacing
-                            )[0]
-                            print('Use previous timepoint prediction as prompt: ', prev_tp+'_lesion_'+str(inst_id))
-                            prompt_bl = torch.from_numpy(prev_seg_resampled).unsqueeze(0).to(self.device).half()
-                            print('Resampled prompt shape: ', prompt_bl.shape)
-                            # Predict the logits using the preprocessed data and the prompt
-                            prediction = self.track_single_lesion(torch.from_numpy(bl_data[np.newaxis,:]).to(self.device), data.unsqueeze(0).to(self.device), prompt_bl.unsqueeze(0)).cpu()
-                            seg = torch.softmax(prediction, 0).argmax(0)
-                            pred = seg.detach().cpu().numpy().astype(np.uint8)
-                            print('Prediction shape: ', pred.shape)
-                            print('Ground truth shape: ',  gt_mask[0].shape)
-                            dice_score = compute_dice_coefficient(gt_mask[0], pred)
-                            if dice_score < 0.1:
-                                print(f'Low Dice score {dice_score:.2f} for lesion {inst_id} at timepoint {timepoint}. Disabling tracking...')
-                                low_score = True
-                            
-                        if (not self.track) or (prev_tp is None) or (low_score and self.adaptive_mode):
-                            use_prev_tp = False
-                            print('Use current timepoint ground truth as prompt: ', p.shape)
-                            # Predict the logits using the preprocessed data and the prompt
-                            prediction = self.predict_logits_from_preprocessed_data(data, p).cpu()
-                            seg = torch.softmax(prediction, 0).argmax(0)
-                            pred = seg.detach().cpu().numpy().astype(np.uint8)
-                            print('Prediction shape: ', pred.shape)
-                            print('Ground truth shape: ', gt_mask[0].shape)
-                            dice_score = compute_dice_coefficient(gt_mask[0], pred)
-                        
-                        error_all['lesion_all']['all']+=1
-                        error_all['lesion_all'][timepoint]['all']+=1
-                        if dice_score >= 0.1:
-                            error_all['lesion_found']['all']+=1
-                            error_all['lesion_found'][timepoint]['all']+=1
-                        print('Dice Score: ', dice_score)
-                        surface_distances = compute_surface_distances(gt_mask[0], pred, self.target_spacing)
-                        hausdorff_score = compute_robust_hausdorff(surface_distances, 95)
-                        nsd_score = compute_surface_dice_at_tolerance(surface_distances, 2)
-                        
-                        dice_score_all.append(dice_score)
-                        hausdorff_score_all.append(hausdorff_score)
-                        nsd_score_all.append(nsd_score)
-                        metrics = {
-                            'dice': dice_score,
-                            'hausdorff': hausdorff_score,
-                            'nsd': nsd_score
-                        }
-                        # Update all metrics in a loop
-                        for metric_name, score in metrics.items():
-                            error_all[metric_name][timepoint]['all'].append(score)
-                            error_all[metric_name][patient_tp]['per_lesion'].append(score)
-                        print('Avg Mean Dice: ', np.mean(dice_score_all))
-                        print('Avg Mean Hausdorff: ',  np.mean(hausdorff_score_all))
-                        print('Avg Mean NSD: ', np.mean(nsd_score_all))
-                        print('Avg Lesion Detection Score: {:.2f}%'.format((error_all['lesion_found']['all'] / error_all['lesion_all']['all']) * 100))
-                        with open(os.path.join(output_folder_or_file, 'error_dict.json'), 'w') as fjson:
-                            json.dump(error_all, fjson)
-                        print('----------')
-                        out_file = ofile + f'_lesion_{inst_id}'
-                        # Visualize the prediction
-                        if self.visualize:
-                            subplot_count = 3
-                            if use_prev_tp:
-                                subplot_count = 4
-                            
-                            # Find axial slice with most lesion pixels
-                            mask_ones_gt_axial = np.where(gt_mask[0] == 1)
-                            if len(mask_ones_gt_axial[0]) > 0:  # Check if mask is not empty
-                                # Find the z-slice with most mask voxels for axial view
-                                largest_mask_slice_id_axial = np.bincount(mask_ones_gt_axial[0]).argmax()
-                            
-                            # Find coronal slice with most lesion pixels
-                            mask_ones_gt_coronal = np.where(gt_mask[0] == 1)
-                            if len(mask_ones_gt_coronal[1]) > 0:  # Check if mask is not empty
-                                # Find the y-slice with most mask voxels for coronal view
-                                largest_mask_slice_id_coronal = np.bincount(mask_ones_gt_coronal[1]).argmax()
-
-                            # Create subplot with 2 rows
-                            fig, axs = plt.subplots(2, subplot_count, figsize=(subplot_count * 4, 8))
-                            
-                            # First row - Axial View
-                            # Original img
-                            axs[0,0].imshow(data[0][largest_mask_slice_id_axial, :, :].detach().cpu().numpy(), cmap='gray')
-                            axs[0,0].set_title('Image (Axial)') 
-                            axs[0,0].axis('off')
-                            # Ground truth
-                            axs[0,1].imshow(data[0][largest_mask_slice_id_axial, :, :].detach().cpu().numpy(), cmap='gray')
-                            axs[0,1].imshow(gt_mask[0][largest_mask_slice_id_axial, :, :]*255, alpha=0.5)
-                            axs[0,1].set_title('Ground truth') 
-                            axs[0,1].axis('off')
-                            # Predictions
-                            axs[0,2].imshow(data[0][largest_mask_slice_id_axial, :, :].detach().cpu().numpy(), cmap='gray')
-                            axs[0,2].imshow(pred[largest_mask_slice_id_axial, :, :], alpha=0.5)
-                            axs[0,2].set_title('Prediction') 
-                            axs[0,2].axis('off')
-
-                            # Second row - Coronal View
-                            # Original img
-                            axs[1,0].imshow(data[0][:, largest_mask_slice_id_coronal, :].detach().cpu().numpy(), cmap='gray', origin='lower')
-                            axs[1,0].set_title('Image (Coronal)') 
-                            axs[1,0].axis('off')
-                            # Ground truth
-                            axs[1,1].imshow(data[0][:, largest_mask_slice_id_coronal, :].detach().cpu().numpy(), cmap='gray', origin='lower')
-                            axs[1,1].imshow(gt_mask[0][:, largest_mask_slice_id_coronal, :]*255, alpha=0.5, origin='lower')
-                            axs[1,1].set_title('Ground truth') 
-                            axs[1,1].axis('off')
-                            # Predictions
-                            axs[1,2].imshow(data[0][:, largest_mask_slice_id_coronal, :].detach().cpu().numpy(), cmap='gray', origin='lower')
-                            axs[1,2].imshow(pred[:, largest_mask_slice_id_coronal, :], alpha=0.5, origin='lower')
-                            axs[1,2].set_title('Prediction') 
-                            axs[1,2].axis('off')
-                            if use_prev_tp:
-                                prompt_bl = prompt_bl[0].detach().cpu().numpy()
-                                try:
-                                    # Axial view for baseline
-                                    mask_ones_gt_axial_bl = np.where(prev_seg_resampled == 1)
-                                    largest_mask_slice_id_axial_bl = np.bincount(mask_ones_gt_axial_bl[0]).argmax()
-                                    axs[0,3].imshow(bl_data[0][largest_mask_slice_id_axial_bl, :, :], cmap='gray')
-                                    axs[0,3].imshow(prev_seg_resampled[largest_mask_slice_id_axial_bl, :, :], alpha=0.5)
-                                    axs[0,3].set_title('Baseline prompt') 
-                                    axs[0,3].axis('off')
-
-                                    # Coronal view for baseline
-                                    mask_ones_gt_coronal_bl = np.where(prev_seg_resampled == 1)
-                                    largest_mask_slice_id_coronal_bl = np.bincount(mask_ones_gt_coronal_bl[1]).argmax()
-                                    axs[1,3].imshow(bl_data[0][:, largest_mask_slice_id_coronal_bl, :], cmap='gray', origin='lower')
-                                    axs[1,3].imshow(prev_seg_resampled[:, largest_mask_slice_id_coronal_bl, :], alpha=0.5, origin='lower')
-                                    axs[1,3].set_title('Baseline prompt') 
-                                    axs[1,3].axis('off')
-                                except Exception as e:
-                                    print(f'Error visualizing baseline prompt: {e}')
-
-                            fig.subplots_adjust(left=0, right=1, bottom=0, top=0.95, wspace=0.05, hspace=0.15)
-                            plt.savefig(os.path.join(output_folder_or_file, f'{out_file}_dice_{dice_score:.2f}.png'), bbox_inches='tight')
-                            plt.close()
-
-                        
-                        r.append(
-                            export_pool.starmap_async(
-                                export_prediction_from_logits,
-                                ((prediction, properties, self.configuration_manager, self.plans_manager,
-                                    self.dataset_json, out_file, False),)
-                            )
-                        )
-
-                        # no multiprocessing
-                        # export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
-                        #     self.dataset_json, out_file, False)
-                    for metric_name in metrics.keys():
-                        error_all[metric_name][patient_tp]['mean'] = np.mean(error_all[metric_name][patient_tp]['per_lesion'])
-                print(f'done with {os.path.basename(ofile)}')
-            error_all['dice']['mean']= np.mean(dice_score_all)
-            error_all['hausdorff']['mean'] = np.mean(hausdorff_score_all)
-            error_all['nsd']['mean'] = np.mean(nsd_score_all)
-            error_all['lesion_found']['mean'] = (error_all['lesion_found']['all']/error_all['lesion_all']['all'])*100
-            for tp in ['TP0','TP1','TP2']:
-                error_all['dice'][tp]['mean']=np.mean(error_all['dice'][tp]['all'])
-                error_all['hausdorff'][tp]['mean']=np.mean(error_all['hausdorff'][tp]['all'])
-                error_all['nsd'][tp]['mean']=np.mean(error_all['nsd'][tp]['all'])
-                error_all['lesion_found'][tp]['mean'] = (error_all['lesion_found'][tp]['all']/error_all['lesion_all'][tp]['all'])*100
-            with open(os.path.join(output_folder_or_file, 'error_dict.json'), 'w') as fjson:
-                json.dump(error_all, fjson)
-            
-            ret = [i.get()[0] for i in r]
-
-        if isinstance(data_iterator, MultiThreadedAugmenter):
-            data_iterator._finish()
-
-        # clear lru cache
-        compute_gaussian.cache_clear()
-        # clear device cache
-        empty_cache(self.device)
-        return ret
-
-
-    @torch.inference_mode()
-    def predict_logits_from_preprocessed_data(self, data: torch.Tensor, dense_prompt: torch.Tensor) -> torch.Tensor:
-        """
-        RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
-        SEE convert_predicted_logits_to_segmentation_with_correct_shape
-        """
-        n_threads = torch.get_num_threads()
-        torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
-        prediction = None
-
-        # Add the dense prompt to the data
-        data = torch.cat([data, dense_prompt], dim=0)
-
-        for params in self.list_of_parameters:
-
-            # messing with state dict names...
-            if not isinstance(self.network, OptimizedModule):
-                self.network.load_state_dict(params)
-            else:
-                self.network._orig_mod.load_state_dict(params)
-        
-            # why not leave prediction on device if perform_everything_on_device? Because this may cause the
-            # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
-            # this actually saves computation time
-            if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data, dense_prompt).to('cpu')
-            else:
-                prediction += self.predict_sliding_window_return_logits(data, dense_prompt).to('cpu')
-
-        if len(self.list_of_parameters) > 1:
-            prediction /= len(self.list_of_parameters)
-
-        if self.verbose: print('Prediction done')
-        torch.set_num_threads(n_threads)
-        return prediction
-    
-
-    def mirror_and_predict(self, x0, x1, prompt):
-        output = self.network_tracker(x0, x1, prompt, is_inference=True)
-        prediction = output[0] if isinstance(output, tuple) else output
-        reg_loss = output[1] if isinstance(output, tuple) and len(output) > 1 else None
-        
-        total_reg_loss = reg_loss.all_loss.item() if reg_loss is not None else 0
-        num_predictions = 1  # Count original prediction
-        
-        if reg_loss is not None:
-            print('Registration Loss:', reg_loss.all_loss.item())
-
-        if self.use_mirroring:
-            mirror_axes = [2, 3, 4]
-            axes_combinations = [
-                c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
-            ]
-
-            for axes in axes_combinations:
-                mirror_output = self.network_tracker(torch.flip(x0, axes), torch.flip(x1, axes), torch.flip(prompt, axes), is_inference=True)
-                mirror_pred = mirror_output[0] if isinstance(mirror_output, tuple) else mirror_output
-                mirror_reg_loss = mirror_output[1] if isinstance(mirror_output, tuple) and len(mirror_output) > 1 else None
-                
-                if mirror_reg_loss is not None:
-                    mirror_loss = mirror_reg_loss.all_loss
-                    total_reg_loss += mirror_loss
-                    num_predictions += 1
-                
-                prediction += torch.flip(mirror_pred, axes)
-            
-            prediction /= (len(axes_combinations) + 1)
-            
-            # Print average registration loss
-            if num_predictions > 0:
-                print('Average Registration Loss: {:.4f}'.format(total_reg_loss / num_predictions))
-        
-        prediction = prediction[0]
-        return prediction
-
-    @torch.inference_mode()
-    def track_single_lesion(self, bl: torch.Tensor, fu: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(self.device.type, dtype=torch.float16, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            prediction = None
-            for params in self.list_of_parameters_tracker: # fold iteration
-                self.network_tracker.load_state_dict(params)
-                self.network_tracker = self.network_tracker.to(self.device)
-                self.network_tracker.eval()
-                print('BL shape', bl.shape, bl.dtype)
-                print('FU shape', fu.shape, fu.dtype)
-                print('PROMPT shape',prompt.shape, prompt.dtype)
-                if prediction is None:
-                    prediction = self.mirror_and_predict(bl, fu, prompt).to('cpu')
-                else:
-                    prediction += self.mirror_and_predict(bl, fu, prompt).to('cpu')
-
-            if len(self.list_of_parameters) > 1:
-                prediction /= len(self.list_of_parameters)
-            return prediction
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...], dense_prompt: torch.Tensor = None) -> List:
         slicers = []
@@ -1157,6 +839,61 @@ class LesionLocatorSegmenter(object):
         return predicted_logits
 
 
+    def setup_tracking_training(self, learning_rate=1e-4, weight_decay=1e-5, use_scheduler=True, finetune_mode='all'):
+        """
+        Setup training components for tracking network: optimizer, loss function, and scheduler.
+        
+        Args:
+            learning_rate: Learning rate for optimizer
+            weight_decay: Weight decay for optimizer
+            use_scheduler: Whether to use learning rate scheduler
+            finetune_mode: Which part to finetune ('reg_net', 'unet', 'all')
+        """
+        if self.network_tracker is None:
+            raise RuntimeError("Tracking network not initialized. Call initialize_from_trained_model_folder first.")
+        
+        # Set tracking network to training mode
+        self.network_tracker.train()
+        self.training_mode = True
+        
+        # Freeze/unfreeze parameters based on finetune_mode for tracking network
+        self._configure_tracking_trainable_parameters(finetune_mode)
+        
+        # Get trainable parameters for optimizer
+        trainable_params = [p for p in self.network_tracker.parameters() if p.requires_grad]
+        
+        # Setup optimizer with only trainable parameters
+        self.optimizer = optim.Adam(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        
+        # Setup loss function for tracking (segmentation + registration loss)
+        self.loss_function = self._tracking_combined_loss
+        
+        # Setup learning rate scheduler
+        if use_scheduler:
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=0.5,
+                patience=10
+            )
+        else:
+            self.scheduler = None
+        
+        # Count and print trainable parameters
+        total_params = sum(p.numel() for p in self.network_tracker.parameters())
+        trainable_params_count = sum(p.numel() for p in self.network_tracker.parameters() if p.requires_grad)
+        frozen_params_count = total_params - trainable_params_count
+        
+        print(f"Tracking training setup complete. Mode: {finetune_mode}, LR: {learning_rate}, Device: {self.device}")
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params_count:,} ({trainable_params_count/1e6:.2f}M)")
+        print(f"Frozen parameters: {frozen_params_count:,} ({frozen_params_count/1e6:.2f}M)")
+        print(f"Trainable ratio: {100*trainable_params_count/total_params:.1f}%")
+
     def setup_training(self, learning_rate=1e-4, weight_decay=1e-5, use_scheduler=True, finetune_mode='all'):
         """
         Setup training components: optimizer, loss function, and scheduler.
@@ -1280,12 +1017,92 @@ class LesionLocatorSegmenter(object):
     def _combined_loss(self, predictions, targets):
         """Combined CrossEntropy + Dice loss for segmentation training."""
         # CrossEntropy loss
-        ce_loss = nn.CrossEntropyLoss()(predictions, targets.long())
+        # apply focal loss
+        # check if target or prediction
+        print(f"targets all zero: {torch.all(targets==0)}, pred all zero: {torch.all(predictions==0)}")
+        weights = torch.tensor([0.01, 0.99], device=predictions.device)  # Adjust weights for foreground and background
+        ce_loss = nn.CrossEntropyLoss(weight=weights)(predictions, targets.long())
+
+        #ce_loss = nn.CrossEntropyLoss()(predictions, targets.long())
         
         # Dice loss (use external function)
         dice_loss_val = dice_loss(predictions, targets)
+
+        print(ce_loss)
         
         return ce_loss + dice_loss_val
+    
+    def _tracking_combined_loss(self, seg_output, reg_loss, targets, reg_loss_weight=1.0, scale_factor=1.0):
+        """Combined segmentation and registration loss for tracking training."""
+        # Segmentation loss (CrossEntropy + Dice)
+        seg_loss = self._combined_loss(seg_output, targets)
+        
+        # Registration loss (if available)
+        total_reg_loss = 0.0
+        if reg_loss is not None:
+            total_reg_loss = reg_loss.all_loss if hasattr(reg_loss, 'all_loss') else reg_loss
+        
+        # Combined loss
+        total_loss = seg_loss + reg_loss_weight * total_reg_loss
+        
+        # Apply scaling for gradient accumulation
+        # if scale_factor != 1.0:
+        #     total_loss = total_loss * scale_factor
+        
+        return total_loss, seg_loss, total_reg_loss
+    
+    def _configure_tracking_trainable_parameters(self, finetune_mode='all'):
+        """
+        Configure which parameters are trainable for tracking network.
+        
+        Args:
+            finetune_mode: 'reg_net', 'unet', or 'all'
+        """
+        print(f"Configuring tracking trainable parameters for mode: {finetune_mode}")
+        
+        if finetune_mode == 'all':
+            # Enable gradients for all parameters
+            for param in self.network_tracker.parameters():
+                param.requires_grad = True
+            print("All tracking parameters enabled for training")
+            
+        elif finetune_mode == 'reg_net':
+            # Freeze all parameters first
+            for param in self.network_tracker.parameters():
+                param.requires_grad = False
+            
+            # Enable registration network parameters only
+            enabled_count = 0
+            for name, param in self.network_tracker.named_parameters():
+                if name.startswith('reg_net.'):
+                    param.requires_grad = True
+                    enabled_count += 1
+                    print(f"  Enabled: {name}")
+            
+            print(f"Registration network mode: {enabled_count} parameter groups enabled")
+            
+        elif finetune_mode == 'unet':
+            # Freeze all parameters first
+            for param in self.network_tracker.parameters():
+                param.requires_grad = False
+            
+            # Enable UNet parameters only
+            enabled_count = 0
+            for name, param in self.network_tracker.named_parameters():
+                if name.startswith('unet.decoder.'):
+                    param.requires_grad = True
+                    enabled_count += 1
+                    print(f"  Enabled: {name}")
+            
+            print(f"UNet mode: {enabled_count} parameter groups enabled")
+            
+        else:
+            raise ValueError(f"Unknown finetune_mode: {finetune_mode}. Use 'reg_net', 'unet', or 'all'")
+        
+        # Print summary of enabled/disabled parameters
+        trainable_params = sum(p.numel() for p in self.network_tracker.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.network_tracker.parameters())
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
     def _visualize_validation_sample(self, data, target, prediction, filename, output_folder, epoch):
         """
@@ -1402,7 +1219,7 @@ class LesionLocatorSegmenter(object):
 
 
         # Create cross-validation folds
-        folds = create_cv_folds(train_input_files, train_prompt_files, train_output_files, n_folds)
+        folds = create_cv_folds(train_input_files, train_prompt_files, train_output_files, n_folds=5)
         
         # Store results from all folds
         all_fold_results = []
@@ -1559,11 +1376,35 @@ class LesionLocatorSegmenter(object):
         if test_dataset is not None:
             print(f"Test samples: {len(test_dataset.input_files)}")
         
-        for epoch in range(epochs):
+        # Check for existing checkpoint to resume training
+        start_epoch = 0
+        if output_folder and fold_idx is not None:
+            fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
+            checkpoint_path = os.path.join(fold_folder, 'best_model.pth')
+            if os.path.exists(checkpoint_path):
+                print(f"Found existing checkpoint: {checkpoint_path}")
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                    self.network.load_state_dict(checkpoint['network_weights'])
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+                    if 'scheduler_state' in checkpoint and self.scheduler is not None:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+                    start_epoch = checkpoint['epoch'] + 1
+                    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                    print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+                except Exception as e:
+                    print(f"Error loading checkpoint: {e}")
+                    print("Starting fresh training...")
+                    start_epoch = 0
+            else:
+                print("No existing checkpoint found, starting fresh training...")
+
+        print(f"number of batches approximately: {len(train_dataloader)}")
+        for epoch in range(start_epoch, epochs):
             # Training phase
             self.network.train()
             epoch_train_loss = 0.0
-            num_train_batches = 0
+            num_train_batches = 0 
             
             print(f"\nFold {fold_idx}, Epoch {epoch+1}/{epochs}")
             print("Training...")
@@ -1588,19 +1429,9 @@ class LesionLocatorSegmenter(object):
                         outputs = self.network(combined_input)
                         loss = self.loss_function(outputs, target)
 
-                    # with autocast():
-                    #     outputs = self.network(combined_input)
-                    #     loss = self.loss_function(outputs, target)
-                    
-                    self.scaler.scale(loss).backward()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-
-                    # self.optimizer.zero_grad()
-                    # outputs = self.network(combined_input)
-                    # loss = self.loss_function(outputs, target)
-                    # loss.backward()
-                    # self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
                                         
                     epoch_train_loss += loss.item()
                     num_train_batches += 1
@@ -1728,7 +1559,7 @@ class LesionLocatorSegmenter(object):
                 if output_folder:
                     fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
                     self._save_checkpoint(fold_folder, 'best_model.pth', epoch, fold_idx=fold_idx, 
-                                        ckpt_path=ckpt_path, prompt_type=prompt_type)
+                                        ckpt_path=ckpt_path, prompt_type=prompt_type, best_val_loss=best_val_loss)
                     print(f"New best model saved for fold {fold_idx} (val_loss: {avg_val_loss:.4f})")
             
             # Save periodic checkpoint
@@ -1749,227 +1580,9 @@ class LesionLocatorSegmenter(object):
             'best_val_loss': best_val_loss
         }
 
-    def train(self, train_dataset, val_dataset=None, epochs=10, batch_size=2, lr=1e-4, 
-              device=None, output_folder=None, num_workers=0, ckpt_path=None, prompt_type='point',
-              finetune_mode='all'):
-        """
-        Training function that uses the existing multiprocessing data loading pipeline
-        with PyTorch DataLoader integration and support for batching.
-        
-        Args:
-            train_dataset: LesionDatasetWrapper for training data
-            val_dataset: LesionDatasetWrapper for validation data (optional)
-            epochs: Number of training epochs
-            batch_size: Batch size (supports batch_size > 1 with fixed patch sizes from TrainingPreprocessor)
-            lr: Learning rate
-            device: Training device (uses self.device if None)
-            output_folder: Folder to save checkpoints
-            num_workers: Number of preprocessing workers (multiprocessing)
-        """
-        if device is None:
-            device = self.device
-            
-        # Setup training components
-        self.setup_training(learning_rate=lr, finetune_mode=finetune_mode)
-        
-        # Move network to device
-        self.network.to(device)
-        
-        # Create DataLoaders with existing multiprocessing pipeline
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,  # Use actual batch_size parameter
-            collate_fn=training_collate_fn,
-            num_workers=0  # Use 0 since we handle multiprocessing internally
-        )
-        
-        val_dataloader = None
-        if val_dataset is not None:
-            val_dataloader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,  # Use actual batch_size for validation too
-                collate_fn=training_collate_fn,
-                num_workers=0
-            )
-        
-        # Training history
-        train_losses = []
-        val_losses = []
-        val_dice_scores = []
-        best_val_loss = float('inf')
-        
-        print(f"Starting training for {epochs} epochs...")
-        print(f"Device: {device}, Learning rate: {lr}")
-        print(f"Training samples: {len(train_dataset.input_files)}")
-        if val_dataset is not None:
-            print(f"Validation samples: {len(val_dataset.input_files)}")
-        
-        for epoch in range(epochs):
-            # Training phase
-            self.network.train()
-            epoch_train_loss = 0.0
-            num_train_batches = 0
-            
-            print(f"\nEpoch {epoch+1}/{epochs}")
-            print("Training...")
-            
-            for batch_idx, batch in enumerate(train_dataloader):
-                # Skip batches to speed up training (process every 50th batch)
-                    
-                try:
-                    # Extract data from batch
-                    data = batch['data'].to(device)      # [B, C, H, W, D] or [C, H, W, D]
-                    prompt = batch['prompt'].to(device)  # [B, 1, H, W, D] or [1, H, W, D]
-                    target = batch['target'].to(device)  # [B, H, W, D] or [H, W, D]
-                    print('Data shape ', data.shape)
-                    print('Prompt shape ', prompt.shape)
-                    print('Target shape ', target.shape)
-                    # Handle both batched and single sample data
-                    if data.dim() == 4:  # Single sample [C, H, W, D]
-                        data = data.unsqueeze(0)      # [1, C, H, W, D]
-                        prompt = prompt.unsqueeze(0)  # [1, 1, H, W, D]
-                        target = target.unsqueeze(0)  # [1, H, W, D]
-                    
-                    # Combine image and prompt as input: [B, C+1, H, W, D]
-                    combined_input = torch.cat([data, prompt], dim=1)
-                    
-                    # Forward pass
-                    self.optimizer.zero_grad()
-                    outputs = self.network(combined_input)  # Network expects [B, C+1, H, W, D]
-                    
-                    # Calculate loss
-                    loss = self.loss_function(outputs, target)
-                    
-                    # Backward pass
-                    loss.backward()
-                    self.optimizer.step()
-                    
-                    # Update metrics
-                    epoch_train_loss += loss.item()
-                    num_train_batches += 1
-                    
-                    if batch_idx % 10 == 0:
-                        batch_size_actual = data.shape[0]
-                        print(f"  Batch {batch_idx} (size={batch_size_actual}), Loss: {loss.item():.4f}")
-                        
-                except Exception as e:
-                    print(f"Error in training batch {batch_idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-            
-            avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
-            train_losses.append(avg_train_loss)
-            print(f"Training Loss: {avg_train_loss:.4f}")
-            
-            # Validation phase
-            if val_dataset is not None:
-                self.network.eval()
-                epoch_val_loss = 0.0
-                epoch_val_dice_scores = []
-                num_val_batches = 0
-                
-                print("Validating...")
-                with torch.no_grad():
-                    for batch_idx, batch in enumerate(val_dataloader):
-                        try:
-                            # Extract data from batch
-                            data = batch['data'].to(device)      # [B, C, H, W, D] or [C, H, W, D]
-                            prompt = batch['prompt'].to(device)  # [B, 1, H, W, D] or [1, H, W, D]
-                            target = batch['target'].to(device)  # [B, H, W, D] or [H, W, D]
-                            properties = batch['properties']     # Metadata
-                            filenames = batch['filename']        # Filenames for visualization
-                            
-                            # Handle both batched and single sample data
-                            if data.dim() == 4:  # Single sample [C, H, W, D]
-                                data = data.unsqueeze(0)      # [1, C, H, W, D]
-                                prompt = prompt.unsqueeze(0)  # [1, 1, H, W, D]
-                                target = target.unsqueeze(0)  # [1, H, W, D]
-                                properties = [properties]     # Make it a list
-                                filenames = [filenames]       # Make it a list
-                            
-                            # Combine image and prompt as input: [B, C+1, H, W, D]
-                            combined_input = torch.cat([data, prompt], dim=1)
-                            outputs = self.network(combined_input)
-                            
-                            # Calculate loss on cropped data
-                            loss = self.loss_function(outputs, target)
-                            epoch_val_loss += loss.item()
-                            num_val_batches += 1
-                            
-                            # Process each sample in the batch for dice computation and visualization
-                            for i in range(data.shape[0]):
-                                filename = os.path.basename(filenames[i]).replace('.nii.gz', '')
-                                
-                                # Get predictions (convert to class predictions)
-                                output_single = outputs[i:i+1]  # Keep batch dimension
-                                pred_probs = torch.softmax(output_single, dim=1)
-                                pred_classes = torch.argmax(pred_probs, dim=1).squeeze(0)  # [H, W, D]
-                                
-                                # Get cropped data and target (what the network actually sees)
-                                data_single = data[i]      # [C, H, W, D] - cropped
-                                target_single = target[i]  # [H, W, D] - cropped
-                                
-                                # Convert to numpy for dice computation (use cropped data)
-                                pred_cropped = pred_classes.cpu().numpy()
-                                target_cropped = target_single.cpu().numpy()
-                                
-                                # Compute Dice score on cropped data (same as what model sees)
-                                dice_score = compute_dice_coefficient(target_cropped, pred_cropped)
-                                epoch_val_dice_scores.append(dice_score)
-                                
-                                # Visualize first few samples of each epoch using cropped data
-                                if batch_idx < 1 and output_folder:  # Save first 3 validation samples
-                                    filename = filenames[i] if isinstance(filenames, list) else f"sample_{i}"
-                                    
-                                    self._visualize_validation_sample(
-                                        data_single, target_cropped, pred_cropped,
-                                        f'{filename}_batch_{batch_idx}_sample_{i}',
-                                        output_folder, epoch
-                                    )
-                            
-                        except Exception as e:
-                            print(f"Error in validation batch {batch_idx}: {e}")
-                            traceback.print_exc()
-                            continue
-                
-                # Compute averages
-                avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
-                avg_val_dice = np.mean(epoch_val_dice_scores) if epoch_val_dice_scores else 0.0
-                
-                val_losses.append(avg_val_loss)
-                val_dice_scores.append(avg_val_dice)
-                print(f"Validation Loss: {avg_val_loss:.4f}")
-                print(f"Validation Dice Score: {avg_val_dice:.4f}")
-                
-                # Update learning rate scheduler
-                if self.scheduler:
-                    self.scheduler.step(avg_val_loss)
-                
-                # Save best model
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    if output_folder:
-                        self._save_checkpoint(output_folder, 'best_model.pth', epoch, fold_idx=0, 
-                                            ckpt_path=ckpt_path, prompt_type=prompt_type)
-            
-            # Save periodic checkpoint
-            if output_folder and (epoch + 1) % 10 == 0:
-                self._save_checkpoint(output_folder, f'checkpoint_epoch_{epoch+1}.pth', epoch, fold_idx=0)
-        
-        # Save final checkpoint
-        if output_folder:
-            self._save_checkpoint(output_folder, 'final_checkpoint.pth', epochs-1, fold_idx=0)
-            
-        print("Training completed!")
-        return {
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'val_dice_scores': val_dice_scores,
-            'best_val_loss': best_val_loss
-        }
-
-    def _save_checkpoint(self, output_folder, filename, epoch, fold_idx=None, ckpt_path=None, prompt_type='point'):
+    def _save_checkpoint(self, output_folder, filename, epoch, 
+                         fold_idx=None, ckpt_path=None, prompt_type='point', best_val_loss=None,
+                         configuration=None):
         """Save model checkpoint and optionally save inference-compatible checkpoint."""
         os.makedirs(output_folder, exist_ok=True)
         checkpoint = {
@@ -1980,6 +1593,8 @@ class LesionLocatorSegmenter(object):
         }
         if self.scheduler:
             checkpoint['scheduler_state'] = self.scheduler.state_dict()
+        if best_val_loss is not None:
+            checkpoint['best_val_loss'] = best_val_loss
             
         checkpoint_path = os.path.join(output_folder, filename)
         torch.save(checkpoint, checkpoint_path)
@@ -2034,6 +1649,10 @@ class LesionLocatorSegmenter(object):
         Returns:
             LesionDatasetWrapper instance
         """
+        input_files = [i for i in input_files if 'TP0' not in os.path.basename(i)]
+        prompt_files = [p for p in prompt_files if 'TP0' not in os.path.basename(p)]
+        output_files = [o for o in output_files if 'TP0' not in os.path.basename(o)]
+
         return LesionDatasetWrapper(
             input_files=input_files,
             prompt_files=prompt_files,
@@ -2042,7 +1661,7 @@ class LesionLocatorSegmenter(object):
             plans_config = self.plans,
             # plans_manager=self.plans_manager,
             dataset_json=self.dataset_json,
-            configuration_config = self.configuration_name,
+            configuration_config = self.configuration_name_tracker,
             modality = self.modality,
             # configuration_manager=self.configuration_manager,
             num_processes=num_processes,
@@ -2050,6 +1669,621 @@ class LesionLocatorSegmenter(object):
             verbose=verbose,
             track=track
         )
+    
+    
+    def train_tracking(self, train_dataset, val_dataset=None, test_dataset=None, epochs=10, batch_size=1, lr=1e-4, 
+                      device=None, output_folder=None, num_workers=0, finetune_mode='all', gradient_accumulation_steps=1):
+        """
+        Training function for tracking model using paired baseline and follow-up data.
+        
+        Args:
+            train_dataset: LesionTrackingDatasetWrapper for training data
+            val_dataset: LesionTrackingDatasetWrapper for validation data (optional)
+            test_dataset: Dataset for test evaluation (optional)
+            epochs: Number of training epochs
+            batch_size: Batch size (typically 1 for tracking due to memory constraints)
+            lr: Learning rate
+            device: Training device (uses self.device if None)
+            output_folder: Folder to save checkpoints
+            num_workers: Number of preprocessing workers
+            finetune_mode: Which part to finetune ('reg_net', 'unet', 'all')
+            gradient_accumulation_steps: Number of steps to accumulate gradients before updating
+        """
+        if device is None:
+            device = self.device
+            
+        # Setup tracking training components
+        self.setup_tracking_training(learning_rate=lr, finetune_mode=finetune_mode)
+        
+        # Move tracking network to device
+        self.network_tracker.to(device)
+        
+        # Create DataLoaders with tracking collate function
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            collate_fn=tracking_collate_fn,
+            num_workers=0  # Use 0 since we handle multiprocessing internally
+        )
+        
+        val_dataloader = None
+        if val_dataset is not None:
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=1, # can only be 1 for validation
+                collate_fn=tracking_collate_fn,
+                num_workers=0
+            )
+        
+
+        test_dataloader = None
+        if test_dataset is not None:
+            test_dataloader = DataLoader(
+                test_dataset,
+                batch_size=1,
+                collate_fn=tracking_collate_fn,
+                num_workers=0
+            )
+        
+        # Training history
+        train_losses = []
+        train_seg_losses = []
+        train_reg_losses = []
+        val_losses = []
+        val_dice_scores = []
+        test_dice_scores = []
+        best_val_loss = float('inf')
+        
+        print(f"Starting tracking training for {epochs} epochs...")
+        print(f"Device: {device}, Learning rate: {lr}")
+        print(f"Batch size: {batch_size}, Gradient accumulation steps: {gradient_accumulation_steps}")
+        print(f"Effective batch size: {batch_size * gradient_accumulation_steps}")
+        
+        # Monitor OOM events
+        oom_count = 0
+        max_oom_retries = 6  # Allow more retries
+        
+        # Clear any existing GPU memory
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        
+        # Print initial memory status
+        print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
+        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        
+        # Suggest memory-efficient settings if memory is limited
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if total_memory < 12:  # Less than 12GB
+            print("WARNING: Limited GPU memory detected. Consider:")
+            print("  - Using batch_size=1 and gradient_accumulation_steps=2-4")
+            print("  - Setting finetune_mode='reg_net' to freeze UNet")
+            print("  - Reducing input patch size in data preprocessing")
+            
+        # Memory optimization settings
+        torch.backends.cudnn.benchmark = False  # Disable for consistent memory usage
+        torch.backends.cudnn.deterministic = True
+        
+        for epoch in range(epochs):
+            # # Training phase
+            self.network_tracker.train()
+            epoch_train_loss = 0.0
+            epoch_seg_loss = 0.0
+            epoch_reg_loss = 0.0
+            num_train_batches = 0
+            
+            print(f"\nEpoch {epoch+1}/{epochs}")
+            print("Training...")
+            
+            for batch_idx, batch in enumerate(train_dataloader):
+                try:
+                    baseline_data = batch['bl_data'].to(device)      # [B, C, H, W, D]
+                    followup_data = batch['fu_data'].to(device)      # [B, C, H, W, D]
+                    baseline_prompt = batch['bl_prompt'].to(device)  # [B, 1, H, W, D]
+                    
+                    target = batch['target'].to(device)                    # [B, H, W, D]
+                    filenames = batch['filename']
+
+                    # if batch_idx % 50 == 0:
+                    #     nonzero_indices = torch.sum(baseline_prompt, axis = (2,3)).nonzero(as_tuple=False)
+                    #     nonzero_indices = nonzero_indices[:, 1]
+                    #     nonzero_indices_target = torch.sum(target, axis = (1,2)).nonzero(as_tuple=False)
+                    #     nonzero_indices_target = nonzero_indices_target[:, 0]
+                    #     # # print(f"Non-zero slice indices in baseline prompt: {nonzero_indices.tolist()}")
+                    #     # # print(f"Non-zero slice indices in target: {nonzero_indices_target.tolist()}")
+                    #     indices = set(nonzero_indices.tolist()).intersection(set(nonzero_indices_target.tolist()))
+                    #     overlap = baseline_prompt * target.unsqueeze(1)  # [B, 1, H, W, D]
+                    #     overlap_sum = torch.sum(overlap, axis=(2,3)).nonzero(as_tuple=False).squeeze()
+                    #     overlap_sum = overlap_sum[:, 1].squeeze()
+                    #     # # print(f"Overlap slice indices between prompt and target: {overlap_sum}")
+
+                    #     if len(indices) == 0:
+                    #         slice_idx = 0
+                    #     else:
+                    #         slice_idx = sorted(indices)[len(indices)//2]
+                    #     # slice_idx = nonzero_indices[sorted(indices)[len(indices)//2]].item()
+                    #     plt.imshow(followup_data[0, slice_idx].detach().cpu(), cmap='gray')
+                    #     plt.imshow(baseline_prompt[0, slice_idx].detach().cpu(), cmap='Reds', alpha=0.5)
+                    #     plt.imshow(target[slice_idx].detach().cpu(), cmap='Greens', alpha=0.5)
+
+                    #     plt.title(f'Baseline Prompt Slice {slice_idx}, overlap: {len(indices)}')
+                    #     plt.show()
+                    #     plt.savefig(f'/home/xiachen/scripts/warped_vis/baseline_prompt_epoch{epoch+1}_batch{batch_idx}.png')
+                    #     plt.close()
+
+                    # Remove channel dimension from prompt - tracknet expects [B, H, W, D]
+                    if baseline_prompt.dim() == 5 and baseline_prompt.shape[1] == 1:
+                        baseline_prompt = baseline_prompt.squeeze(1)  # [B, H, W, D]
+                    
+                    # Handle both batched and single sample data
+                    if baseline_data.dim() == 4:  # Single sample [C, H, W, D]
+                        baseline_data = baseline_data.unsqueeze(0)      # [1, C, H, W, D]
+                        followup_data = followup_data.unsqueeze(0)      # [1, C, H, W, D]
+                        baseline_prompt = baseline_prompt.unsqueeze(0)  # [1, H, W, D]
+                        target = target.unsqueeze(0)                    # [1, H, W, D]
+                    
+                    # Clear gradients at start of accumulation cycle
+                    #if batch_idx % gradient_accumulation_steps == 0:
+                    
+                    self.optimizer.zero_grad()
+                    
+                    with autocast('cuda'):
+                        # Training mode with proper x1_mask parameter
+                        try:
+                            seg_output, reg_loss, x1_mask_cropped = self.network_tracker(baseline_data, followup_data, baseline_prompt, 
+                                                                                         is_inference=False, x1_mask=target, visualize=False)
+
+                            x1_mask_cropped = x1_mask_cropped.squeeze(1)  # [B, H, W, D]
+                            # Calculate combined loss using the cropped target
+                            # Calculate combined loss with scaling for gradient accumulation
+                            total_loss, seg_loss, reg_loss_val = self._tracking_combined_loss(seg_output, reg_loss, x1_mask_cropped)
+
+                            if batch_idx % 50 == 0:
+                                # Compute and print dice on cropped target for monitoring
+                                dice_loss_val = dice_loss(seg_output, x1_mask_cropped)
+                                dice = 1.0 - dice_loss_val.item()
+                                # seg = torch.softmax(seg_output, 1).argmax(1)
+                                # pred = seg.detach().cpu().numpy().astype(np.uint8)
+                                # dice = compute_dice_coefficient(pred, x1_mask_cropped.detach().cpu().numpy().astype(np.uint8))
+                                # print(f"pred: {set(np.unique(pred))}, target: {set(np.unique(x1_mask_cropped.detach().cpu().numpy().astype(np.uint8)))}")
+                                print(f"Batch {batch_idx}, Dice on cropped target: {dice:.4f}, reg_loss: {reg_loss_val:.4f}", flush=True)
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                oom_count += 1
+                                # print(f"CUDA OOM in forward pass at batch {batch_idx} (OOM #{oom_count}). Clearing cache and skipping batch.")
+                                # print(f"Current GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved() / 1024**3:.2f} GB reserved")
+                                
+                                if oom_count >= max_oom_retries:
+                                    print(f"Too many OOM errors ({oom_count}). Consider reducing batch size or gradient accumulation steps.")
+                                    print("Suggested fixes:")
+                                    print("  1. Use --batch_size 1 --gradient_accumulation_steps 1")
+                                    print("  2. Use --finetune reg_net to only train registration network")
+                                    print("  3. Check if your GPU has enough memory for this model")
+                                    raise RuntimeError(f"Too many OOM errors ({oom_count}). Training stopped.")
+                                
+                                # Aggressive cleanup
+                                torch.cuda.empty_cache()
+                                # Clear intermediate variables
+                                del baseline_data, followup_data, baseline_prompt, target
+                                if 'seg_output' in locals():
+                                    del seg_output
+                                if 'reg_loss' in locals():
+                                    del reg_loss
+                                if 'x1_mask_cropped' in locals():
+                                    del x1_mask_cropped
+                                torch.cuda.empty_cache()
+                                import gc
+                                gc.collect()
+                                continue
+                            else:
+                                raise e
+                    
+                    # Backward pass
+                    try:
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            oom_count += 1
+                            print(f"CUDA OOM in backward pass at batch {batch_idx} (OOM #{oom_count}). Clearing cache and skipping batch.")
+                            print(f"Current GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved() / 1024**3:.2f} GB reserved")
+                            
+                            if oom_count >= max_oom_retries:
+                                print(f"Too many OOM errors ({oom_count}). Consider reducing batch size or gradient accumulation steps.")
+                                print("Suggested fixes:")
+                                print("  1. Use --batch_size 1 --gradient_accumulation_steps 1") 
+                                print("  2. Use --finetune reg_net to only train registration network")
+                                print("  3. Check if your GPU has enough memory for this model")
+                                raise RuntimeError(f"Too many OOM errors ({oom_count}). Training stopped.")
+                            
+                            # Aggressive cleanup
+                            torch.cuda.empty_cache()
+                            # Clear all tensors
+                            del baseline_data, followup_data, baseline_prompt, target
+                            del seg_output, reg_loss, x1_mask_cropped, total_loss, seg_loss
+                            torch.cuda.empty_cache()
+                            import gc
+                            gc.collect()
+                            continue
+                        else:
+                            raise e
+                    
+                    # Update metrics (scale back the loss for display/tracking)
+                    epoch_train_loss += total_loss.item() # * gradient_accumulation_steps  # Unscale for correct average
+                    epoch_seg_loss += seg_loss.item()
+                    epoch_reg_loss += reg_loss_val if isinstance(reg_loss_val, (int, float)) else reg_loss_val.item()
+                    num_train_batches += 1
+                    
+                    # Clear intermediate tensors to free memory
+                    del baseline_data, followup_data, baseline_prompt, target
+                    del seg_output, reg_loss, x1_mask_cropped, total_loss, seg_loss
+                    
+                    # Periodic memory cleanup - more aggressive for tracking
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    
+                    if batch_idx % 10 == 0:  # Less frequent reporting
+                        print(f"  Batch {batch_idx}")
+                        print(f"    Total Loss: {epoch_train_loss/num_train_batches:.4f}")
+                        print(f"    Seg Loss: {epoch_seg_loss/num_train_batches:.4f}")
+                        print(f"    Reg Loss: {epoch_reg_loss/num_train_batches:.4f}")
+                        print(f"    GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                        print(f"    GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+                        print(f"    Max GPU memory allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
+                        
+                except Exception as e:
+                    print(f"Error in training batch {batch_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            # Compute average losses
+            avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
+            avg_seg_loss = epoch_seg_loss / max(num_train_batches, 1)
+            avg_reg_loss = epoch_reg_loss / max(num_train_batches, 1)
+            
+            train_losses.append(avg_train_loss)
+            train_seg_losses.append(avg_seg_loss)
+            train_reg_losses.append(avg_reg_loss)
+            
+            print(f"Training - Total Loss: {avg_train_loss:.4f}, Seg Loss: {avg_seg_loss:.4f}, Reg Loss: {avg_reg_loss:.4f}")
+            
+            # Validation phase
+            if val_dataset is not None:
+                self.network_tracker.eval()
+                epoch_val_loss = 0.0
+                epoch_val_dice_scores = []
+                num_val_batches = 0
+                
+                print("Validating...")
+                with torch.no_grad():
+                    for batch_idx, batch in enumerate(val_dataloader):
+                        try:
+                            # Extract validation data from batch
+                            baseline_data = batch['bl_data'].to(device)
+                            followup_data = batch['fu_data'].to(device)
+                            baseline_prompt = batch['bl_prompt'].to(device)
+                            target = batch['target'].to(device)
+                            filenames = batch['filename']
+                            
+                            # Remove channel dimension from prompt - tracknet expects [B, H, W, D]
+                            baseline_prompt = baseline_prompt.squeeze(1)  # [B, H, W, D]
+                            
+                            # Handle both batched and single sample data
+                            if baseline_data.dim() == 4:
+                                baseline_data = baseline_data.unsqueeze(0)
+                                followup_data = followup_data.unsqueeze(0)
+                                baseline_prompt = baseline_prompt.unsqueeze(0)
+                                target = target.unsqueeze(0)
+                                filenames = [filenames]
+                            
+                            with autocast('cuda'):
+                                # Training mode with proper x1_mask parameter
+                                seg_output, reg_loss, x1_mask_cropped = self.network_tracker(baseline_data, followup_data, baseline_prompt, is_inference=False, x1_mask=target)
+                                x1_mask_cropped = x1_mask_cropped.squeeze(1)  # [B, H, W, D]
+                                total_loss, seg_loss, reg_loss_val = self._tracking_combined_loss(seg_output, reg_loss, x1_mask_cropped)
+                            
+                            # seg_loss = self._combined_loss(seg_output, target.to(seg_output.device))
+                            epoch_val_loss += reg_loss.all_loss.item() + seg_loss.item()
+                            num_val_batches += 1
+                            
+                            # Compute dice scores for each sample in the batch
+                            # for i in range(baseline_data.shape[0]):
+                            #     # Get predictions (convert to class predictions)
+                            #     output_single = seg_output[i:i+1]
+                            #     pred_probs = torch.softmax(output_single, dim=1)
+                            #     pred_classes = torch.argmax(pred_probs, dim=1).squeeze(0)
+                                
+                            #     # Get target
+                            #     target_single = target[i]
+                                
+                            #     # Convert to numpy for dice computation
+                            #     pred_np = pred_classes.cpu().numpy()
+                            #     target_np = target_single.cpu().numpy()
+                                
+                            #     # Compute Dice score
+                            #     dice_score = compute_dice_coefficient(target_np, pred_np)
+                            epoch_val_dice_scores.append(1-seg_loss.item())
+                            
+                        except Exception as e:
+                            print(f"Error in validation batch {batch_idx}: {e}")
+                            traceback.print_exc()
+                            continue
+                
+                # Compute averages
+                avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
+                avg_val_dice = np.mean(epoch_val_dice_scores) if epoch_val_dice_scores else 0.0
+                
+                val_losses.append(avg_val_loss)
+                val_dice_scores.append(avg_val_dice)
+                print(f"Validation Loss: {avg_val_loss:.4f}")
+                print(f"Validation Dice Score: {avg_val_dice:.4f}")
+                
+                # Update learning rate scheduler
+                if self.scheduler:
+                    self.scheduler.step(avg_val_loss)
+                
+                # Save best model
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    if output_folder:
+                        self._save_tracking_checkpoint(output_folder, 'best_tracking_model.pth', epoch)
+            
+            # Test evaluation phase
+            # test_dice_score = 0.0
+            # if test_dataset is not None:
+            #     print("Testing...")
+            #     test_dice_score = self._evaluate_test_dataset(test_dataset, test_dataloader, device, epoch, output_folder)
+            #     test_dice_scores.append(test_dice_score)
+            #     print(f"Test Dice Score: {test_dice_score:.4f}")
+            
+            # Save periodic checkpoint
+            if output_folder and (epoch + 1) % 10 == 0:
+                self._save_tracking_checkpoint(output_folder, f'tracking_checkpoint_epoch_{epoch+1}.pth', epoch)
+        
+        # Save final checkpoint
+        if output_folder:
+            self._save_tracking_checkpoint(output_folder, 'final_tracking_checkpoint.pth', epochs-1)
+            
+        print("Tracking training completed!")
+        return {
+            'train_losses': train_losses,
+            'train_seg_losses': train_seg_losses,
+            'train_reg_losses': train_reg_losses,
+            'val_losses': val_losses,
+            'val_dice_scores': val_dice_scores,
+            'test_dice_scores': test_dice_scores,
+            'best_val_loss': best_val_loss
+        }
+    
+    
+    def _save_tracking_checkpoint(self, output_folder, filename, epoch):
+        """Save tracking model checkpoint."""
+        os.makedirs(output_folder, exist_ok=True)
+        checkpoint = {
+            'epoch': epoch,
+            'network_weights': self.network_tracker.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'trainer_name': self.trainer_name_tracker,
+        }
+        if self.scheduler:
+            checkpoint['scheduler_state'] = self.scheduler.state_dict()
+            
+        checkpoint_path = os.path.join(output_folder, filename)
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Tracking checkpoint saved: {checkpoint_path}")
+
+    def _evaluate_test_dataset(self, test_dataset, test_dataloader, device, epoch, output_folder=None):
+        """
+        Evaluate the tracking model on test dataset and return average dice score.
+        
+        Args:
+            test_dataset: Test dataset
+            test_dataloader: Test data loader  
+            device: Device for evaluation
+            epoch: Current epoch number (for visualization folder naming)
+            output_folder: Output folder for visualizations (optional)
+            
+        Returns:
+            Average dice score across test samples
+        """
+        self.network_tracker.eval()
+        test_dice_scores = []
+        reg_losses = []
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_dataloader):
+                # This is tracking test data
+                baseline_data = batch['bl_data'].to(device)
+                followup_data = batch['fu_data'].to(device)  
+                baseline_prompt = batch['bl_prompt'].to(device)
+                target = batch['target'].to(device)
+                filenames = batch['filename']
+                
+                # Remove channel dimension from prompt
+                baseline_prompt = baseline_prompt.squeeze(1)
+                
+                # Handle single sample case
+                if baseline_data.dim() == 4:
+                    baseline_data = baseline_data.unsqueeze(0)
+                    followup_data = followup_data.unsqueeze(0)
+                    baseline_prompt = baseline_prompt.unsqueeze(0)
+                    target = target.unsqueeze(0)
+                    filenames = [filenames]
+                
+                # Forward pass
+                with autocast('cuda'):
+                    # For inference, network_tracker returns only (seg_output, reg_loss)
+                    network_output = self.network_tracker(
+                        baseline_data, followup_data, baseline_prompt, is_inference=False
+                    )
+                    if len(network_output) == 3:
+                        seg_output, reg_loss, x1_mask_cropped = network_output
+                    else:
+                        seg_output, reg_loss = network_output
+                        x1_mask_cropped = None
+                
+                reg_losses.append(reg_loss.all_loss.item())
+                # Compute dice scores for each sample in the batch
+                for i in range(baseline_data.shape[0]):
+                    # Get predictions (convert to class predictions)
+                    output_single = seg_output[i:i+1]
+                    pred_probs = torch.softmax(output_single, dim=1)
+                    pred_classes = torch.argmax(pred_probs, dim=1).squeeze(0)
+                    
+                    # Get target
+                    # target_single = target[i]
+                    
+                    # Convert to numpy for dice computation
+                    # pred_np = pred_classes.cpu().numpy()
+                    # target_np = target_single.cpu().numpy()
+                    
+                    # Compute Dice score
+                    # dice_score = compute_dice_coefficient(target_np, pred_np)
+                    # test_dice_scores.append(dice_score)
+                    dice_loss_val = dice_loss(seg_output, target.to(seg_output.device))
+                    dice = 1.0 - dice_loss_val.item()
+ 
+                    # # Visualize some test samples (every 10th sample and first 3 samples)
+                    # if output_folder and (len(test_dice_scores) <= 3 or len(test_dice_scores) % 10 == 0):
+                    #     self._visualize_tracking_test_sample(
+                    #         baseline_data[i], followup_data[i], baseline_prompt[i], 
+                    #         target_single, pred_classes, filenames[i], 
+                    #         output_folder, epoch, dice_score
+                    #     )
+        print(f'average registration loss on test set: {np.mean(reg_losses):.4f}')
+        # Return average dice score
+        return np.mean(test_dice_scores) if test_dice_scores else 0.0
+
+    def _visualize_tracking_test_sample(self, baseline_data, followup_data, baseline_prompt, target, prediction, 
+                                       filename, output_folder, epoch, dice_score):
+        """
+        Visualize tracking test sample with baseline, follow-up, prompt, target and prediction.
+        """
+        # Create test visualization folder
+        test_vis_folder = os.path.join(output_folder, f'test_vis_epoch_{epoch}')
+        os.makedirs(test_vis_folder, exist_ok=True)
+        
+        # Convert to numpy arrays
+        baseline_np = baseline_data[0].cpu().numpy() if baseline_data.dim() > 3 else baseline_data.cpu().numpy()
+        followup_np = followup_data[0].cpu().numpy() if followup_data.dim() > 3 else followup_data.cpu().numpy()
+        prompt_np = baseline_prompt.cpu().numpy()
+        target_np = target.cpu().numpy()
+        pred_np = prediction.cpu().numpy()
+        
+        # Find the axial slice with the most target pixels
+        target_sums = np.sum(target_np[0], axis=(1, 2))
+        max_slice = np.argmax(target_sums) if np.max(target_sums) > 0 else target_np.shape[0] // 2
+
+        ratio = max_slice / target_np.shape[1] 
+        #max_slice = int(ratio * baseline_np.shape[0])
+        
+        # Ensure max_slice is within bounds for all arrays
+        # min_depth = min(baseline_np.shape[0], prompt_np.shape[0], followup_np.shape[0], target_np.shape[0], pred_np.shape[0])
+        max_slice = max(max_slice, 0)
+        
+        # Create visualization
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # First row - baseline data
+        bl_max_slice = int(ratio * baseline_np.shape[1])
+        axes[0, 0].imshow(baseline_np[0, bl_max_slice, :, :], cmap='gray')
+        axes[0, 0].set_title('Baseline Image')
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(baseline_np[0, bl_max_slice, :, :], cmap='gray')  
+        axes[0, 1].imshow(prompt_np[0, bl_max_slice, :, :], alpha=0.5, cmap='Greens')
+        axes[0, 1].set_title('Baseline + Prompt')
+        axes[0, 1].axis('off')
+        
+        fu_max_slice = int(ratio * followup_np.shape[1])
+        axes[0, 2].imshow(followup_np[0, fu_max_slice, :, :], cmap='gray')
+        axes[0, 2].set_title('Follow-up Image')
+        axes[0, 2].axis('off')
+        
+        # Second row - targets and predictions
+        axes[1, 0].imshow(followup_np[0, fu_max_slice, :, :], cmap='gray')
+        axes[1, 0].imshow(target_np[0, max_slice, :, :], alpha=0.5, cmap='Reds') 
+        axes[1, 0].set_title('Ground Truth')
+        axes[1, 0].axis('off')
+        
+        axes[1, 1].imshow(followup_np[0, fu_max_slice, :, :], cmap='gray')
+        axes[1, 1].imshow(pred_np[0, max_slice, :, :], alpha=0.5, cmap='Blues')
+        axes[1, 1].set_title('Prediction')
+        axes[1, 1].axis('off')
+        
+        # Overlay comparison
+        axes[1, 2].imshow(followup_np[0, fu_max_slice, :, :], cmap='gray')
+        axes[1, 2].imshow(target_np[0, max_slice, :, :], alpha=0.3, cmap='Reds')
+        axes[1, 2].imshow(pred_np[0, max_slice, :, :], alpha=0.3, cmap='Blues') 
+        axes[1, 2].set_title('GT (Red) + Pred (Blue)')
+        axes[1, 2].axis('off')
+        
+        plt.suptitle(f'Tracking Test Sample - Dice: {dice_score:.3f}')
+        plt.tight_layout()
+        
+        # Save with descriptive filename
+        safe_filename = filename.replace('/', '_').replace('\\', '_')
+        save_path = os.path.join(test_vis_folder, f'{safe_filename}_dice_{dice_score:.3f}.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+    def _visualize_test_sample(self, data, target, prediction, filename, output_folder, epoch, dice_score):
+        """
+        Visualize segmentation test sample with image, target and prediction.
+        """
+        # Create test visualization folder  
+        test_vis_folder = os.path.join(output_folder, f'test_vis_epoch_{epoch}')
+        os.makedirs(test_vis_folder, exist_ok=True)
+        
+        # Convert to numpy arrays
+        data_np = data[0].cpu().numpy() if data.dim() > 3 else data.cpu().numpy()
+        target_np = target.cpu().numpy()
+        pred_np = prediction.cpu().numpy()
+        
+        # Find the axial slice with the most target pixels
+        target_sums = np.sum(target_np, axis=(1, 2))
+        max_slice = np.argmax(target_sums) if np.max(target_sums) > 0 else target_np.shape[0] // 2
+        
+        # Create visualization
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        
+        # Original image
+        axes[0].imshow(data_np[max_slice, :, :], cmap='gray')
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        # Ground truth
+        axes[1].imshow(data_np[max_slice, :, :], cmap='gray')
+        axes[1].imshow(target_np[max_slice, :, :], alpha=0.5, cmap='Reds')
+        axes[1].set_title('Ground Truth')
+        axes[1].axis('off')
+        
+        # Prediction
+        axes[2].imshow(data_np[max_slice, :, :], cmap='gray')
+        axes[2].imshow(pred_np[max_slice, :, :], alpha=0.5, cmap='Blues')
+        axes[2].set_title('Prediction') 
+        axes[2].axis('off')
+        
+        # Overlay comparison
+        axes[3].imshow(data_np[max_slice, :, :], cmap='gray')
+        axes[3].imshow(target_np[max_slice, :, :], alpha=0.3, cmap='Reds')
+        axes[3].imshow(pred_np[max_slice, :, :], alpha=0.3, cmap='Blues')
+        axes[3].set_title('GT (Red) + Pred (Blue)')
+        axes[3].axis('off')
+        
+        plt.suptitle(f'Segmentation Test Sample - Dice: {dice_score:.3f}')
+        plt.tight_layout()
+        
+        # Save with descriptive filename
+        safe_filename = filename.replace('/', '_').replace('\\', '_')
+        save_path = os.path.join(test_vis_folder, f'{safe_filename}_dice_{dice_score:.3f}.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
 
 
 def train_from_prompt():
@@ -2057,14 +2291,12 @@ def train_from_prompt():
     parser = argparse.ArgumentParser(description='This function handles the LesionLocator single timepoint segmentation'
                                      'training using a point or 3D box prompt. Prompts can be the coordinates of a '
                                      'point or a 3D box as .json files or also (ground truth) instance segmentation maps.')
+     
     parser.add_argument('-i', type=str, required=True,
                         help='Input image file or folder containing images to be predicted. File endings should be .nii.gz'
                         ' or specify another file_ending in the dataset.json file of the downloaded checkpoint.')
     parser.add_argument('-iv', type=str, required=False,
                         help='TEST image files or folder. Used for dice computation and visualization after each epoch in cross-validation. File endings should be .nii.gz')
-    parser.add_argument('-o', type=str, required=True,
-                        help='Output folder. If the folder does not exist it will be created. Cross-validation results and checkpoints'
-                             'will be saved with fold-specific subfolders.')
     parser.add_argument('-p', type=str, required=True,
                         help='TRAINING prompt file or folder with prompts. Can contain .json files with a point or 3D box or instance'
                         'segmentation maps (.nii.gz). The file containing the prompt must have the same name as the image it belongs to.'
@@ -2074,6 +2306,10 @@ def train_from_prompt():
                         help='TEST prompt files or folder with test segmentation maps (.nii.gz). Used for dice computation and visualization after each epoch. The file containing the prompt must have the same name as the image it belongs to.'
                         'If instance segmentation maps are used, they must be in the same shape as the input images. Binary masks '
                         'will be converted to instance segmentations.')
+
+    parser.add_argument('-o', type=str, required=True,
+                        help='Output folder. If the folder does not exist it will be created. Training results and checkpoints'
+                             'will be saved here.')
     parser.add_argument('-t', type=str, required=True, choices=['point', 'box'], default='box',
                         help='Specify the type of prompt. Options are "point" or "box". Default: box')
     parser.add_argument('-m', type=str, required=True,
@@ -2106,10 +2342,10 @@ def train_from_prompt():
     parser.add_argument('--visualize', action='store_true', required=False, default=False,
                         help='Set this flag to visualize the prediction. This will open a napari viewer. You may need to '
                         ' run python -m pip install "napari[all]" first to use this feature.')
-    parser.add_argument('--track', action='store_true', required=False, default=False,
-                        help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
+    # parser.add_argument('--track', action='store_true', required=False, default=False,
+    #                     help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet'], default='ct', help="Use this to set the modality")
-    parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
+    # parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, required=False, default=1,
@@ -2118,12 +2354,16 @@ def train_from_prompt():
                         help='Learning rate for training. Default: 1e-4')
     parser.add_argument('--batch_size', type=int, required=False, default=3,
                         help='Batch size for training. Default: 3')
+    parser.add_argument('--gradient_accumulation_steps', type=int, required=False, default=1,
+                        help='Number of steps to accumulate gradients before updating. Effective batch size = batch_size * gradient_accumulation_steps. Default: 1')
     parser.add_argument('--num_workers', type=int, required=False, default=4,
                         help='Number of workers for data loading. Default: 4')
     parser.add_argument('--ckpt_path', type=str, required=False, default=None,
                         help='Path to save inference-compatible checkpoints. Will create LesionLocatorSeg/point_optimized/fold_X structure. Default: None (no inference checkpoints saved)')
-    parser.add_argument('--finetune', type=str, required=False, default='all', choices=['encoder', 'decoder', 'all'],
-                        help='Which part of the model to finetune. Options: encoder, decoder, all. Default: all')
+    parser.add_argument('--finetune', type=str, required=False, default='all', choices=['reg_net', 'unet', 'all'],
+                        help='Which part of the tracking model to finetune. Options: reg_net (registration network only), unet (segmentation network only), all (both networks). Default: all')
+    parser.add_argument('--reinit', action = 'store_true', required=False, default=False,
+                        help='Which part of the tracking model to reinitialize before training. Options: reg_net (registration network only), unet (segmentation network only), all (both networks), none (no reinitialization). Default: none')
     parser.add_argument('--train_fold', type=int, required=False, default=None,
                         help='Which fold configuration to use for training. Default: 0')
 
@@ -2135,6 +2375,7 @@ def train_from_prompt():
         "CVPR.\n#######################################################################\n")
 
     args = parser.parse_args()
+    
     args.f = [i if i == 'all' else int(i) for i in args.f]
 
     if not isdir(args.o):
@@ -2157,56 +2398,41 @@ def train_from_prompt():
     else:
         device = torch.device('mps')
 
-    predictor = LesionLocatorSegmenter(tile_step_size=args.step_size,
-                                use_gaussian=True,
-                                use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
-                                device=device,
-                                verbose=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar,
-                                verbose_preprocessing=args.verbose,
-                                visualize=args.visualize,
-                                track=args.track,
-                                adaptive_mode=args.adaptive_mode)
-    optimized_ckpt = "bbox_optimized" if args.t == 'box' else "point_optimized"
-    checkpoint_folder = join(args.m, 'LesionLocatorSeg', optimized_ckpt)
+
+    # Initialize tracking trainer
+    trainer = LesionLocatorTrack(
+            tile_step_size=0.5,
+            use_gaussian=True,
+            use_mirroring=True,
+            perform_everything_on_device=True,
+            device=device,
+            verbose=args.verbose,
+            allow_tqdm=True,
+            verbose_preprocessing=args.verbose,
+            visualize=args.visualize,
+            adaptive_mode=False
+        )
+        
+    # Load model checkpoints
+    checkpoint_folder = join(args.m, 'LesionLocatorSeg', 'point_optimized')  # Use point optimized for tracking
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
-    predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth")
-    
-    # Training mode
-    print("Starting training mode...")
-    
-    # Print checkpoint path information if provided
-    if args.ckpt_path:
-        optimized_folder = "point_optimized" if args.t == 'point' else "bbox_optimized"
-        print(f"Inference-compatible checkpoints will be saved to:")
-        print(f"  {args.ckpt_path}/LesionLocatorSeg/{optimized_folder}/fold_X/checkpoint_final.pth")
-        print(f"  This structure is compatible with the inference code.")
-    else:
-        print("No inference checkpoint path specified (--ckpt_path). Only training checkpoints will be saved.")
-    
-    # Print fine-tuning mode information
-    print(f"Fine-tuning mode: {args.finetune}")
-    if args.finetune == 'encoder':
-        print("  Only encoder parameters will be trained (decoder frozen)")
-    elif args.finetune == 'decoder':
-        print("  Only decoder parameters will be trained (encoder frozen)")
-    elif args.finetune == 'all':
-        print("  All model parameters will be trained")
-    
-    # Get training files
+    trainer.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, 
+                                                 modality = args.modality, checkpoint_name="checkpoint_final.pth",
+                                                 reinit = args.reinit)
+        
+    # Complete the tracking training function
     if os.path.isdir(args.i):
-        train_input_files = subfiles(args.i, suffix=predictor.dataset_json['file_ending'], join=True, sort=True)
+        train_input_files = subfiles(args.i, suffix=trainer.dataset_json_tracker['file_ending'], join=True, sort=True)
     else:
         train_input_files = [args.i]
-        
+    
     if os.path.isdir(args.p):
-        train_prompt_files = subfiles(args.p, suffix=predictor.dataset_json['file_ending'], join=True, sort=True)
+        train_prompt_files = subfiles(args.p, suffix=trainer.dataset_json_tracker['file_ending'], join=True, sort=True)
     else:
         train_prompt_files = [args.p]
         
     # Create output file names for training
-    train_output_files = [join(args.o, 'train_' + os.path.basename(i).replace(predictor.dataset_json['file_ending'], '')) for i in train_input_files]
+    train_output_files = [join(args.o, 'train_' + os.path.basename(i).replace(trainer.dataset_json_tracker['file_ending'], '')) for i in train_input_files]
     
     # Get TEST files (renamed from validation - these are your actual test data)
     test_input_files = None
@@ -2216,69 +2442,97 @@ def train_from_prompt():
     
     if hasattr(args, 'iv') and args.iv:
         if os.path.isdir(args.iv):
-            test_input_files = subfiles(args.iv, suffix=predictor.dataset_json['file_ending'], join=True, sort=True)
+            test_input_files = subfiles(args.iv, suffix=trainer.dataset_json_tracker['file_ending'], join=True, sort=True)
         else:
             test_input_files = [args.iv]
-            
+
+        test_input_files = [i for i in test_input_files if 'TP0' not in os.path.basename(i)]
+
     if hasattr(args, 'pv') and args.pv:
         if os.path.isdir(args.pv):
-            test_prompt_files = subfiles(args.pv, suffix=predictor.dataset_json['file_ending'], join=True, sort=True)
+            test_prompt_files = subfiles(args.pv, suffix=trainer.dataset_json_tracker['file_ending'], join=True, sort=True)
         else:
             test_prompt_files = [args.pv]
+        
+        test_prompt_files = [i for i in test_prompt_files if 'TP0' not in os.path.basename(i)]
             
     if test_input_files and test_prompt_files:
-        test_output_files = [join(args.o, 'test_' + os.path.basename(i).replace(predictor.dataset_json['file_ending'], '')) for i in test_input_files]
+        test_output_files = [join(args.o, 'test_' + os.path.basename(i).replace(trainer.dataset_json_tracker['file_ending'], '')) for i in test_input_files]
         
         # Create test dataset for dice computation and visualization
-        test_dataset = predictor.create_training_dataset(
+        test_dataset = trainer.create_training_dataset(
             input_files=test_input_files,
             prompt_files=test_prompt_files,
             output_files=test_output_files,
             prompt_type=args.t,
             num_processes=args.npp,
             verbose=args.verbose,
-            track=args.track
+            track=True
         )
         print(f"Test dataset created with {len(test_input_files)} samples")
+        
+    # Helper function to process file arguments (handles folders, individual files, and wildcard expansions)
+    # def process_file_args(file_args, suffix):
+    #     all_files = []
+    #     for arg in file_args:
+    #         if os.path.isdir(arg):
+    #             # If it's a directory, get all files with the specified suffix
+    #             from lesionlocator.utilities.file_path_utilities import subfiles
+    #             all_files.extend(subfiles(arg, suffix=suffix, join=True, sort=True))
+    #         else:
+    #             # If it's a file (or expanded from wildcard), add it directly
+    #             all_files.append(arg)
+    #     return sorted(all_files)
     
-    print(f"Training dataset created with {len(train_input_files)} samples")
-    
-    # Start cross-validation training
-    all_fold_results = predictor.train_cross_validation(
-        train_input_files=train_input_files,
-        train_prompt_files=train_prompt_files,
-        train_output_files=train_output_files,
+    folds = create_cv_folds(train_input_files, train_prompt_files, train_output_files, n_folds=5)
+
+    fold_data = folds[args.train_fold] if args.train_fold is not None else folds[0]
+    # Create training dataset
+    train_dataset = trainer.create_training_dataset(
+            input_files=fold_data['train']['input_files'],
+            prompt_files=fold_data['train']['prompt_files'],
+            output_files=fold_data['train']['output_files'],
+            prompt_type=args.t,
+            num_processes=args.npp,
+            verbose=args.verbose,
+            track=True
+    )
+    print(f"Training dataset created with {len(fold_data['train']['input_files'])} samples")
+
+    val_dataset = trainer.create_training_dataset(
+            input_files=fold_data['val']['input_files'],
+            prompt_files=fold_data['val']['prompt_files'],
+            output_files=fold_data['val']['output_files'],
+            prompt_type=args.t,
+            num_processes=args.npp,
+            verbose=args.verbose,
+            track=True
+    ) 
+    print(f"Validation dataset created with {len(fold_data['val']['input_files'])} samples")
+        
+    # Start tracking training
+    training_results = trainer.train_tracking(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
         test_dataset=test_dataset,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         device=device,
         output_folder=args.o,
-        n_folds=5,
-        num_workers=args.num_workers,
-        prompt_type=args.t,
-        ckpt_path=args.ckpt_path,
+        num_workers=0,  # Set to 0 for tracking
         finetune_mode=args.finetune,
-        train_fold=args.train_fold,
+        # gradient_accumulation_steps=args.gradient_accumulation_steps
     )
-    
-    print("Cross-validation training completed!")
-    
-    # Print summary statistics from all folds
-    if all_fold_results:
-        # Get final metrics from each fold
-        final_train_losses = [fold['train_losses'][-1] for fold in all_fold_results]
-        final_val_losses = [fold['val_losses'][-1] for fold in all_fold_results]
-        best_val_losses = [fold['best_val_loss'] for fold in all_fold_results]
         
-        print(f"Mean final training loss across folds: {np.mean(final_train_losses):.4f} ± {np.std(final_train_losses):.4f}")
-        print(f"Mean final validation loss across folds: {np.mean(final_val_losses):.4f} ± {np.std(final_val_losses):.4f}")
-        print(f"Mean best validation loss across folds: {np.mean(best_val_losses):.4f} ± {np.std(best_val_losses):.4f}")
+    print("Tracking training completed!")
+    print(f"Final training loss: {training_results['train_losses'][-1]:.4f}")
+    if training_results['val_losses']:
+        print(f"Final validation loss: {training_results['val_losses'][-1]:.4f}")
+        print(f"Best validation loss: {training_results['best_val_loss']:.4f}")
+    if training_results['test_dice_scores']:
+        print(f"Final test dice score: {training_results['test_dice_scores'][-1]:.4f}")
+        print(f"Best test dice score: {max(training_results['test_dice_scores']):.4f}")
+    
+    return  # Exit after tracking training
         
-        if all_fold_results[0]['test_dice_scores']:
-            final_test_dice = [fold['test_dice_scores'][-1] for fold in all_fold_results]
-            print(f"Mean final test dice across folds: {np.mean(final_test_dice):.4f} ± {np.std(final_test_dice):.4f}")
-
-
-if __name__ == "__main__":
-    train_from_prompt()

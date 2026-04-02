@@ -26,6 +26,7 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
     try:
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(input_files)):
+            print(f'Preprocessing file {idx+1}/{len(input_files)}: {input_files[idx]} with prompt {prompt_files[idx]}', flush=True)
             if prompt_files[idx].endswith('.json'):
                 seg = None
                 data, _, data_properties, bl_data, bl_data_properties  = preprocessor.run_case([input_files[idx]],
@@ -47,8 +48,10 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                                                     track)
                 prompt = get_prompt_from_inst_or_bin_seg(seg, prompt_type)
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
+
             item = {'data': data, 'prompt': prompt, 'seg':seg, 'data_properties': data_properties, 'ofile': output_files[idx], 'bl_data': bl_data, 'bl_data_properties': bl_data_properties}
             success = False
+            print(f'Putting preprocessed item {idx+1}/{len(input_files)} into the queue...', flush=True)
             while not success:
                 try:
                     if abort_event.is_set():
@@ -59,7 +62,7 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                     pass
         done_event.set()
     except Exception as e:
-        # print(Exception, e)
+        print(Exception, e, flush=True)
         abort_event.set()
         raise e
 

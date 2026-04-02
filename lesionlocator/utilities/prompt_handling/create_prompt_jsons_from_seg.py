@@ -2,6 +2,8 @@ import os
 import cc3d
 import json
 import argparse
+import random
+
 
 import numpy as np
 import SimpleITK as sitk
@@ -13,17 +15,35 @@ def save_json(json_data, output_path):
 	with open(output_path, 'w') as f:
 		json.dump(json_data, f, indent=4)
 
-def create_point_json(stats):
-	point_json = {}
-	for idx, p in enumerate(stats["centroids"][1:]):
-		# check for none
-		if any(np.isnan(p)):
-			continue
 
-		point_json[idx+1] = {
-			"point": [str(round(coord, 2)) for coord in p]
-		}
-	return point_json
+def create_point_json(stats, im_array):
+    point_json = {}
+    labels = stats["labels"][1:]  # skip background (label 0)
+    for idx, label in enumerate(labels):
+        # Find all voxel indices for this label
+        coords = np.argwhere(im_array == label)
+        if coords.size == 0:
+            continue
+        # Pick a random voxel
+        rand_idx = random.randint(0, len(coords) - 1)
+        rand_point = coords[rand_idx]
+        point_json[idx+1] = {
+            "point": [str(int(coord)) for coord in rand_point]
+        }
+    return point_json
+
+
+# def create_point_json(stats):
+# 	point_json = {}
+# 	for idx, p in enumerate(stats["centroids"][1:]):
+# 		# check for none
+# 		if any(np.isnan(p)):
+# 			continue
+
+# 		point_json[idx+1] = {
+# 			"point": [str(round(coord, 2)) for coord in p]
+# 		}
+# 	return point_json
 
 def create_box_json(stats):
 	box_json = {}
@@ -58,7 +78,7 @@ def create_prompt_jsons(label_path: str, output_path: str, label_type: str):
 		stats = cc3d.statistics(im_array.astype(np.uint16), no_slice_conversion=True)
 
 		# Create json
-		point_json = create_point_json(stats)
+		point_json = create_point_json(stats, im_array)
 		box_json = create_box_json(stats)
 
 		save_json(point_json, os.path.join(output_path, "points", lbl.replace(".nii.gz", ".json")))
