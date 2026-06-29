@@ -105,3 +105,8 @@ ENV/
 *.pdf
 
 *.model
+
+
+
+echo ".vscode/" >> .gitignore
+echo "*.yaml" >> .gitignore

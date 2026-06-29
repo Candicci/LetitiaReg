@@ -1,0 +1,313 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    gpu-fraction-num-devices: "1"
+    gpu-memory: "16000"
+    k8s.v1.cni.cncf.io/network-status: |-
+      [{
+          "name": "cilium",
+          "interface": "eth0",
+          "ips": [
+              "172.16.76.115"
+          ],
+          "mac": "7e:fb:9d:78:cb:38",
+          "default": true,
+          "dns": {},
+          "gateway": [
+              "172.16.76.48"
+          ]
+      }]
+    karpenter.sh/do-not-disrupt: "true"
+    pod-group-name: pg-backtoproject-0-dea51c72-8b7e-4851-85c8-314f04c98f76
+    received-resource-type: Fraction
+    runai-allocated-gpu-memory: "16000"
+    runai-allocated-gpus: "0.46566128730773926"
+    runai-allocated-mig-gpus: "0"
+    runai-calculated-status: Running
+    runai-cli-command: runai submit backtoproject -i registry.rcp.epfl.ch/letitia-candiotti/pytorch:v1
+      --gpu-memory 16G --project letitia-candiotti --supplemental-groups 83305 --memory
+      60G --memory-limit 75G --large-shm --pvc letitia-scratch:/scratch --pvc home:/home/candiotti
+      --interactive --command -- /bin/bash -c sleep infinity
+    runai-nodepools: v100 default
+    runai/shared-gpu-configmap: backtoproject-qghmx5b-runai-sh-gpu
+    user: chiara.candiotti@epfl.ch
+  creationTimestamp: "2026-06-24T12:18:13Z"
+  generateName: backtoproject-
+  labels:
+    app: runaijob
+    controller-uid: dea51c72-8b7e-4851-85c8-314f04c98f76
+    createdBy: RunaiJob
+    priorityClassName: build
+    project: letitia-candiotti
+    release: backtoproject
+    run.ai/top-owner-uid: f30b2e51-f707-4bc3-a708-ffb049df7510
+    runai-gpu-group: 55513d19-1927-4066-bc23-05a8e077ee92
+    runai/node-pool: v100
+    runai/pod-index: 0-0
+    workloadKind: InteractiveWorkload
+    workloadName: backtoproject
+  name: backtoproject-0-0
+  namespace: runai-letitia-candiotti
+  ownerReferences:
+  - apiVersion: run.ai/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: RunaiJob
+    name: backtoproject
+    uid: dea51c72-8b7e-4851-85c8-314f04c98f76
+  resourceVersion: "3505008461"
+  uid: a88e87b5-da5d-414f-a96b-6ffb3ab05514
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: rcp.epfl.ch/runai-node-pool
+            operator: In
+            values:
+            - V100
+        - matchExpressions:
+          - key: runai/node-pool
+            operator: DoesNotExist
+  containers:
+  - command:
+    - /bin/bash
+    - -c
+    - sleep infinity
+    env:
+    - name: HOME
+      value: /home/runai-home
+    - name: POD_INDEX
+      value: "0"
+    - name: NVIDIA_VISIBLE_DEVICES
+      valueFrom:
+        configMapKeyRef:
+          key: RUNAI-VISIBLE-DEVICES
+          name: backtoproject-qghmx5b-runai-sh-gpu-0
+    - name: RUNAI_NUM_OF_GPUS
+      valueFrom:
+        configMapKeyRef:
+          key: RUNAI_NUM_OF_GPUS
+          name: backtoproject-qghmx5b-runai-sh-gpu-0
+    - name: RUNAI_GPU_MEMORY_REQUEST
+      value: "16000000000"
+    - name: RUNAI_GPU_MEMORY_LIMIT
+      value: "16000000000"
+    - name: jobUUID
+      value: dea51c72-8b7e-4851-85c8-314f04c98f76
+    - name: JOB_UUID
+      value: dea51c72-8b7e-4851-85c8-314f04c98f76
+    - name: jobName
+      value: backtoproject
+    - name: JOB_NAME
+      value: backtoproject
+    - name: podUUID
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.uid
+    - name: POD_UUID
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.uid
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: spec.nodeName
+    envFrom:
+    - configMapRef:
+        name: backtoproject-qghmx5b-runai-sh-gpu-0-evar
+        optional: false
+    image: registry.rcp.epfl.ch/letitia-candiotti/pytorch:v1
+    imagePullPolicy: Always
+    name: backtoproject
+    resources:
+      limits:
+        memory: 75G
+      requests:
+        cpu: 100m
+        memory: 60G
+    securityContext:
+      allowPrivilegeEscalation: true
+      seccompProfile:
+        type: RuntimeDefault
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /scratch
+      name: pvc-volume-0
+    - mountPath: /home/candiotti
+      name: pvc-volume-1
+    - mountPath: /dev/shm
+      name: dshm
+    - mountPath: /home/runai-home
+      name: user-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-45whv
+      readOnly: true
+    - mountPath: /etc/ld.so.preload
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      subPath: ld.so.preload-key
+    - mountPath: /etc/runai.d/memory
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      subPath: config
+    - mountPath: /etc/runai.d/pod_uuid
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      subPath: pod-uuid
+    - mountPath: /runai/shared
+      name: runai-shared-directory
+      readOnly: true
+    - mountPath: /etc/runai.d/route
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      subPath: route
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  nodeName: gpu257.rcp.epfl.ch
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Never
+  schedulerName: runai-scheduler
+  securityContext:
+    supplementalGroups:
+    - 83305
+  serviceAccount: default
+  serviceAccountName: default
+  terminationGracePeriodSeconds: 30
+  tolerations:
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+    tolerationSeconds: 300
+  - effect: NoExecute
+    key: node.kubernetes.io/unreachable
+    operator: Exists
+    tolerationSeconds: 300
+  volumes:
+  - name: pvc-volume-0
+    persistentVolumeClaim:
+      claimName: letitia-scratch
+  - name: pvc-volume-1
+    persistentVolumeClaim:
+      claimName: home
+  - emptyDir:
+      medium: Memory
+    name: dshm
+  - emptyDir: {}
+    name: user-data
+  - name: kube-api-access-45whv
+    projected:
+      defaultMode: 420
+      sources:
+      - serviceAccountToken:
+          expirationSeconds: 3607
+          path: token
+      - configMap:
+          items:
+          - key: ca.crt
+            path: ca.crt
+          name: kube-root-ca.crt
+      - downwardAPI:
+          items:
+          - fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+            path: namespace
+  - configMap:
+      defaultMode: 420
+      name: backtoproject-qghmx5b-runai-sh-gpu-0
+    name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+  - hostPath:
+      path: /var/lib/runai/shared
+      type: DirectoryOrCreate
+    name: runai-shared-directory
+status:
+  conditions:
+  - lastProbeTime: null
+    lastTransitionTime: "2026-06-24T12:18:27Z"
+    message: Pod bound successfully to node gpu257.rcp.epfl.ch
+    reason: Bound
+    status: "True"
+    type: PodBound
+  - lastProbeTime: null
+    lastTransitionTime: "2026-06-24T12:19:05Z"
+    status: "True"
+    type: PodReadyToStartContainers
+  - lastProbeTime: null
+    lastTransitionTime: "2026-06-24T12:18:27Z"
+    status: "True"
+    type: Initialized
+  - lastProbeTime: null
+    lastTransitionTime: "2026-06-24T12:19:05Z"
+    status: "True"
+    type: Ready
+  - lastProbeTime: null
+    lastTransitionTime: "2026-06-24T12:19:05Z"
+    status: "True"
+    type: ContainersReady
+  - lastProbeTime: null
+    lastTransitionTime: "2026-06-24T12:18:27Z"
+    status: "True"
+    type: PodScheduled
+  containerStatuses:
+  - containerID: containerd://94d78a231466501dd13306fe11f3f3ddc30f2af86c4d213df1aeeada3cf125ba
+    image: registry.rcp.epfl.ch/letitia-candiotti/pytorch:v1
+    imageID: registry.rcp.epfl.ch/letitia-candiotti/pytorch@sha256:d50782bb987d8ef05ec7cb8f15e2bf5c20b337872ab48e645454c147499f7ce1
+    lastState: {}
+    name: backtoproject
+    ready: true
+    restartCount: 0
+    started: true
+    state:
+      running:
+        startedAt: "2026-06-24T12:19:04Z"
+    volumeMounts:
+    - mountPath: /scratch
+      name: pvc-volume-0
+    - mountPath: /home/candiotti
+      name: pvc-volume-1
+    - mountPath: /dev/shm
+      name: dshm
+    - mountPath: /home/runai-home
+      name: user-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-45whv
+      readOnly: true
+      recursiveReadOnly: Disabled
+    - mountPath: /etc/ld.so.preload
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      recursiveReadOnly: Disabled
+    - mountPath: /etc/runai.d/memory
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      recursiveReadOnly: Disabled
+    - mountPath: /etc/runai.d/pod_uuid
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      recursiveReadOnly: Disabled
+    - mountPath: /runai/shared
+      name: runai-shared-directory
+      readOnly: true
+      recursiveReadOnly: Disabled
+    - mountPath: /etc/runai.d/route
+      name: backtoproject-qghmx5b-runai-sh-gpu-0-vol
+      readOnly: true
+      recursiveReadOnly: Disabled
+  hostIP: 10.92.136.20
+  hostIPs:
+  - ip: 10.92.136.20
+  phase: Running
+  podIP: 172.16.76.115
+  podIPs:
+  - ip: 172.16.76.115
+  qosClass: Burstable
+  startTime: "2026-06-24T12:18:27Z"

@@ -10,7 +10,7 @@ import SimpleITK as sitk
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-sys.path.insert(0, '/home/carissima/LesionLocator/lesionlocator')
+sys.path.insert(0, '/home/chiara/LesionLocator/lesionlocator')
 
 from preprocessing.resampling.default_resampling import (
     resample_data_or_seg_to_spacing
@@ -23,9 +23,8 @@ from lesionlocator.preprocessing.normalization.map_channel_name_to_normalization
 Dataset pour charger les paires CT/PET longitudinales.
 - CT: Dataset800_USZMelanoma (channel 0000)
 - PET: Dataset900_USZMelanoma (channel 0001)
-Gère le resampling PET → spacing CT, crop à la shape CT,
-normalisation CT/PET, split train/val,
-et paires bidirectionnelles (T0→T1 et T1→T0).
+Gère le resampling PET → spacing CT, normalisation CT/PET,
+split train/val, et paires bidirectionnelles (T0→T1 et T1→T0).
 """
 
 CT_DIR = "/scratch/nnUNet_raw/Dataset800_USZMelanoma/imagesTr"
@@ -98,32 +97,6 @@ def resample_pet_to_ct_spacing(pet_image: sitk.Image, ct_image: sitk.Image) -> n
     return pet_resampled[0]
 
 
-def crop_to_ct_shape(pet_array: np.ndarray, ct_array: np.ndarray) -> np.ndarray:
-    """
-    Centre-crop le PET resamplé pour matcher exactement la shape du CT.
-    Nécessaire car le PET a un FOV physiquement plus large que le CT.
-
-    Args:
-        pet_array: (D, H, W) — PET après resampling
-        ct_array:  (D, H, W) — CT de référence
-
-    Returns:
-        pet_array cropé à la shape de ct_array
-    """
-    pet_d, pet_h, pet_w = pet_array.shape
-    ct_d,  ct_h,  ct_w  = ct_array.shape
-
-    start_d = max((pet_d - ct_d) // 2, 0)
-    start_h = max((pet_h - ct_h) // 2, 0)
-    start_w = max((pet_w - ct_w) // 2, 0)
-
-    return pet_array[
-        start_d : start_d + ct_d,
-        start_h : start_h + ct_h,
-        start_w : start_w + ct_w
-    ]
-
-
 # =============================================================================
 # DATASET PYTORCH
 # =============================================================================
@@ -152,7 +125,7 @@ class CTPETDataset(Dataset):
             self.dataset = {k: v for k, v in self.dataset.items() if k in patient_ids}
             print(f"Filtered to {len(self.dataset)} patients")
 
-        # Instancier les normaliseurs une seule fois
+        # Instancier les normaliseurs une seule fois (pas dans __getitem__)
         CTNorm = get_normalization_scheme('ct')
         self.ct_normalizer = CTNorm(
             use_mask_for_norm=False,
@@ -195,13 +168,10 @@ class CTPETDataset(Dataset):
         ct_source_array = sitk.GetArrayFromImage(ct_source).astype(np.float32)
         ct_target_array = sitk.GetArrayFromImage(ct_target).astype(np.float32)
 
-        # Resample PET → spacing CT + crop à la shape CT
+        # Resample PET → spacing CT
         if self.resample_pet:
             pet_source_array = resample_pet_to_ct_spacing(pet_source, ct_source)
             pet_target_array = resample_pet_to_ct_spacing(pet_target, ct_target)
-            # Crop pour matcher exactement la shape CT
-            pet_source_array = crop_to_ct_shape(pet_source_array, ct_source_array)
-            pet_target_array = crop_to_ct_shape(pet_target_array, ct_target_array)
         else:
             pet_source_array = sitk.GetArrayFromImage(pet_source).astype(np.float32)
             pet_target_array = sitk.GetArrayFromImage(pet_target).astype(np.float32)
@@ -223,8 +193,6 @@ class CTPETDataset(Dataset):
         assert pet_source_array.dtype == np.float32
         assert not np.isnan(ct_source_array).any(), "NaN dans CT source!"
         assert not np.isnan(pet_source_array).any(), "NaN dans PET source!"
-        assert ct_source_array.shape == pet_source_array.shape, \
-            f"Shape mismatch: CT {ct_source_array.shape} vs PET {pet_source_array.shape}"
 
         return {
             'patient_id': patient_id,
@@ -301,7 +269,7 @@ if __name__ == "__main__":
     print(f"   Train: {len(train_ds)} paires")
     print(f"   Val:   {len(val_ds)} paires")
 
-    print("\n4. Test chargement + normalisation + crop sur patient 008...")
+    print("\n4. Test chargement + normalisation sur patient 008...")
     try:
         ds = CTPETDataset(patient_ids=['008'], bidirectional=False, resample_pet=True)
         sample = ds[0]
@@ -311,8 +279,6 @@ if __name__ == "__main__":
               f"min={sample['ct_source'].min():.2f}, max={sample['ct_source'].max():.2f}")
         print(f"   PET source shape: {sample['pet_source'].shape}, "
               f"min={sample['pet_source'].min():.2f}, max={sample['pet_source'].max():.2f}")
-        assert sample['ct_source'].shape == sample['pet_source'].shape, "Shape mismatch!"
-        print("   ✅ Shapes identiques CT == PET !")
         print("   ✅ Normalisation OK !")
     except Exception as e:
         print(f"   ❌ Erreur: {e}")
@@ -320,3 +286,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("FIN DU TEST")
     print("=" * 60)
+    
+    
+    
