@@ -1,6 +1,7 @@
 import sys
 import os
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader
 from datetime import datetime
@@ -29,11 +30,36 @@ SAVE_DIR    = "/home/chiara/checkpoints"
 LOG_DIR     = "/home/chiara/logs"
 EVAL_EVERY  = 5          # évaluer tous les 5 epochs
 
+# Shape attendue par uniGradICON pré-entraîné
+UNIGRADICON_SHAPE = (175, 175, 175)
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,  exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
+
+
+# =============================================================================
+# RESIZE — uniGradICON attend une shape fixe (175,175,175)
+# =============================================================================
+
+def resize_to_unigradicon_shape(tensor: torch.Tensor, target_shape=UNIGRADICON_SHAPE) -> torch.Tensor:
+    """
+    Redimensionne un tensor (B, C, D, H, W) vers la shape attendue par uniGradICON.
+    Utilise l'interpolation trilinéaire (adaptée aux volumes 3D continus comme CT/PET).
+
+    ⚠️ Perte de résolution spatiale : CT natif (389,512,512) → (175,175,175).
+    Point à valider avec la prof — alternative possible: patch-based training.
+    """
+    assert tensor.dim() == 5, f"Tensor doit être (B,C,D,H,W), reçu shape {tensor.shape}"
+    return F.interpolate(
+        tensor,
+        size=target_shape,
+        mode='trilinear',
+        align_corners=False
+    )
+
 
 # =============================================================================
 # DATALOADER
@@ -61,8 +87,9 @@ def get_dataloaders():
     print(f"Train: {len(train_ds)} paires | Val: {len(val_ds)} paires")
     return train_loader, val_loader
 
+
 # =============================================================================
-# TRAINING
+# TRAINING — version actuelle : fine-tuning sur CT uniquement
 # =============================================================================
 
 def train_one_epoch(net, optimizer, loader, epoch):
@@ -73,6 +100,10 @@ def train_one_epoch(net, optimizer, loader, epoch):
         # uniGradICON prend (moving, fixed) — on utilise CT pour la registration
         ct_source = batch['ct_source'].to(device)  # (B, 1, D, H, W)
         ct_target = batch['ct_target'].to(device)  # (B, 1, D, H, W)
+
+        # Resize vers la shape attendue par uniGradICON (175,175,175)
+        ct_source = resize_to_unigradicon_shape(ct_source)
+        ct_target = resize_to_unigradicon_shape(ct_target)
 
         optimizer.zero_grad()
         loss_object = net(ct_source, ct_target)
@@ -96,6 +127,9 @@ def evaluate(net, loader, epoch):
             ct_source = batch['ct_source'].to(device)
             ct_target = batch['ct_target'].to(device)
 
+            ct_source = resize_to_unigradicon_shape(ct_source)
+            ct_target = resize_to_unigradicon_shape(ct_target)
+
             loss_object = net(ct_source, ct_target)
             loss = torch.mean(loss_object.all_loss)
             losses.append(loss.item())
@@ -103,6 +137,80 @@ def evaluate(net, loader, epoch):
     mean_loss = np.mean(losses)
     print(f"  Val   loss: {mean_loss:.4f}")
     return mean_loss
+
+
+# =============================================================================
+# ⚠️ FINE-TUNING CT + PET (futur) — la prof a demandé d'itérer aussi sur PET
+# =============================================================================
+#
+# Idée : entraîner le réseau sur les DEUX modalités, pas seulement CT.
+# Deux approches possibles à discuter avec la prof :
+#
+# APPROCHE A — Loss combinée (CT et PET dans le même forward, pondérée)
+# -----------------------------------------------------------------------
+# def train_one_epoch_ct_pet(net, optimizer, loader, epoch, pet_weight=0.3):
+#     net.train()
+#     losses = []
+#
+#     for batch in tqdm(loader, desc=f"Epoch {epoch}"):
+#         ct_source  = resize_to_unigradicon_shape(batch['ct_source'].to(device))
+#         ct_target  = resize_to_unigradicon_shape(batch['ct_target'].to(device))
+#         pet_source = resize_to_unigradicon_shape(batch['pet_source'].to(device))
+#         pet_target = resize_to_unigradicon_shape(batch['pet_target'].to(device))
+#
+#         optimizer.zero_grad()
+#
+#         # Registration sur CT (phi calculé sur l'anatomie)
+#         loss_object_ct = net(ct_source, ct_target)
+#         loss_ct = torch.mean(loss_object_ct.all_loss)
+#
+#         # Registration sur PET (même réseau, autre paire)
+#         loss_object_pet = net(pet_source, pet_target)
+#         loss_pet = torch.mean(loss_object_pet.all_loss)
+#
+#         # Loss combinée pondérée — CT prioritaire (meilleur contraste anatomique)
+#         loss = loss_ct + pet_weight * loss_pet
+#         loss.backward()
+#         optimizer.step()
+#
+#         losses.append(loss.item())
+#
+#     mean_loss = np.mean(losses)
+#     print(f"  Train loss (CT+PET): {mean_loss:.4f}")
+#     return mean_loss
+#
+#
+# APPROCHE B — Alterner les batches CT et PET (curriculum simple)
+# -----------------------------------------------------------------------
+# def train_one_epoch_alternating(net, optimizer, loader, epoch):
+#     net.train()
+#     losses = []
+#
+#     for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
+#         if i % 2 == 0:
+#             source = resize_to_unigradicon_shape(batch['ct_source'].to(device))
+#             target = resize_to_unigradicon_shape(batch['ct_target'].to(device))
+#         else:
+#             source = resize_to_unigradicon_shape(batch['pet_source'].to(device))
+#             target = resize_to_unigradicon_shape(batch['pet_target'].to(device))
+#
+#         optimizer.zero_grad()
+#         loss_object = net(source, target)
+#         loss = torch.mean(loss_object.all_loss)
+#         loss.backward()
+#         optimizer.step()
+#
+#         losses.append(loss.item())
+#
+#     mean_loss = np.mean(losses)
+#     print(f"  Train loss (alternating CT/PET): {mean_loss:.4f}")
+#     return mean_loss
+#
+# ⚠️ Point à valider avec la prof avant d'implémenter :
+#    - pet_weight : quelle pondération entre CT et PET dans la loss ?
+#    - Le PET a un bruit/contraste très différent du CT — la même loss
+#      similarity (NCC) est-elle adaptée, ou faut-il une loss spécifique PET ?
+# =============================================================================
 
 
 # =============================================================================
@@ -123,7 +231,7 @@ if __name__ == "__main__":
     # 3. Dataloaders
     train_loader, val_loader = get_dataloaders()
 
-    # 4. Boucle d'entraînement
+    # 4. Boucle d'entraînement (CT uniquement pour l'instant)
     best_val_loss = float('inf')
 
     for epoch in range(1, EPOCHS + 1):
