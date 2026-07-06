@@ -1,5 +1,8 @@
 import sys
 import os
+import time
+import argparse
+import logging
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -23,12 +26,13 @@ from icon_registration.losses import to_floats
 CT_DIR  = "/scratch/nnUNet_raw/Dataset800_USZMelanoma/imagesTr"
 PET_DIR = "/scratch/nnUNet_raw/Dataset900_USZMelanoma/imagesTr"
 
-EPOCHS      = 50
+
+EPOCHS      = 100        # plafond large — on garde le meilleur modèle sur val_loss
 LR          = 1e-5       # fine-tuning → lr faible
 BATCH_SIZE  = 1          # images 3D volumineuses
 SAVE_DIR    = "/home/chiara/checkpoints"
 LOG_DIR     = "/home/chiara/logs"
-EVAL_EVERY  = 5          # évaluer tous les 5 epochs
+EVAL_EVERY  = 1          # évaluer à chaque epoch (run potentiellement coupé)
 
 # Shape attendue par uniGradICON pré-entraîné
 UNIGRADICON_SHAPE = (175, 175, 175)
@@ -37,7 +41,30 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,  exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
+
+
+# =============================================================================
+# LOGGING — (B) écrire dans un fichier ET dans le terminal
+# =============================================================================
+
+def setup_logging():
+    """
+    Configure le logging pour écrire à la fois dans la console et dans un fichier.
+    Le fichier permet de récupérer la courbe de loss après coup, même si le
+    terminal est fermé ou le pod redémarré.
+    """
+    log_file = os.path.join(LOG_DIR, f"train_{datetime.now().strftime('%Y%m%d-%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    logging.info(f"Logging vers {log_file}")
+    return log_file
 
 
 # =============================================================================
@@ -47,18 +74,13 @@ print(f"Device: {device}")
 def resize_to_unigradicon_shape(tensor: torch.Tensor, target_shape=UNIGRADICON_SHAPE) -> torch.Tensor:
     """
     Redimensionne un tensor (B, C, D, H, W) vers la shape attendue par uniGradICON.
-    Utilise l'interpolation trilinéaire (adaptée aux volumes 3D continus comme CT/PET).
+    Interpolation trilinéaire (adaptée aux volumes 3D continus CT/PET).
 
-    ⚠️ Perte de résolution spatiale : CT natif (389,512,512) → (175,175,175).
-    Point à valider avec la prof — alternative possible: patch-based training.
+    ⚠️ Perte de résolution : CT natif (389,512,512) → (175,175,175).
+    Point à valider avec la prof — alternative: patch-based training.
     """
-    assert tensor.dim() == 5, f"Tensor doit être (B,C,D,H,W), reçu shape {tensor.shape}"
-    return F.interpolate(
-        tensor,
-        size=target_shape,
-        mode='trilinear',
-        align_corners=False
-    )
+    assert tensor.dim() == 5, f"Tensor doit être (B,C,D,H,W), reçu {tensor.shape}"
+    return F.interpolate(tensor, size=target_shape, mode='trilinear', align_corners=False)
 
 
 # =============================================================================
@@ -70,51 +92,63 @@ def get_dataloaders():
 
     train_ds = CTPETDataset(
         ct_dir=CT_DIR, pet_dir=PET_DIR,
-        patient_ids=train_ids,
-        bidirectional=True,
-        resample_pet=True
+        patient_ids=train_ids, bidirectional=True, resample_pet=True
     )
     val_ds = CTPETDataset(
         ct_dir=CT_DIR, pet_dir=PET_DIR,
-        patient_ids=val_ids,
-        bidirectional=False,
-        resample_pet=True
+        patient_ids=val_ids, bidirectional=False, resample_pet=True
     )
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    print(f"Train: {len(train_ds)} paires | Val: {len(val_ds)} paires")
+    logging.info(f"Train: {len(train_ds)} paires | Val: {len(val_ds)} paires")
     return train_loader, val_loader
 
 
 # =============================================================================
-# TRAINING — version actuelle : fine-tuning sur CT uniquement
+# TRAINING — fine-tuning sur CT, avec (A) protection OOM GPU
 # =============================================================================
 
 def train_one_epoch(net, optimizer, loader, epoch):
     net.train()
     losses = []
+    skipped = 0
 
     for batch in tqdm(loader, desc=f"Epoch {epoch}"):
-        # uniGradICON prend (moving, fixed) — on utilise CT pour la registration
-        ct_source = batch['ct_source'].to(device)  # (B, 1, D, H, W)
-        ct_target = batch['ct_target'].to(device)  # (B, 1, D, H, W)
+        try:
+            ct_source = resize_to_unigradicon_shape(batch['ct_source'].to(device))
+            ct_target = resize_to_unigradicon_shape(batch['ct_target'].to(device))
 
-        # Resize vers la shape attendue par uniGradICON (175,175,175)
-        ct_source = resize_to_unigradicon_shape(ct_source)
-        ct_target = resize_to_unigradicon_shape(ct_target)
+            optimizer.zero_grad()
+            loss_object = net(ct_source, ct_target)
+            loss = torch.mean(loss_object.all_loss)
+            loss.backward()
+            optimizer.step()
 
-        optimizer.zero_grad()
-        loss_object = net(ct_source, ct_target)
-        loss = torch.mean(loss_object.all_loss)
-        loss.backward()
-        optimizer.step()
+            losses.append(loss.item())
 
-        losses.append(loss.item())
+        except RuntimeError as e:
+            # (A) Si OOM GPU sur une paire : on skip au lieu de tout perdre
+            if "out of memory" in str(e).lower():
+                skipped += 1
+                logging.warning(f"  OOM sur une paire (patient {batch['patient_id']}), skip. "
+                                f"Total skipped: {skipped}")
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise  # autre erreur → on la laisse remonter
 
-    mean_loss = np.mean(losses)
-    print(f"  Train loss: {mean_loss:.4f}")
+        finally:
+            # Libérer la mémoire GPU après chaque paire
+            if 'ct_source' in locals():
+                del ct_source
+            if 'ct_target' in locals():
+                del ct_target
+
+    mean_loss = float(np.mean(losses)) if losses else float('nan')
+    logging.info(f"  Train loss: {mean_loss:.4f} ({len(losses)} paires, {skipped} skipped)")
     return mean_loss
 
 
@@ -124,68 +158,84 @@ def evaluate(net, loader, epoch):
 
     with torch.no_grad():
         for batch in loader:
-            ct_source = batch['ct_source'].to(device)
-            ct_target = batch['ct_target'].to(device)
+            try:
+                ct_source = resize_to_unigradicon_shape(batch['ct_source'].to(device))
+                ct_target = resize_to_unigradicon_shape(batch['ct_target'].to(device))
 
-            ct_source = resize_to_unigradicon_shape(ct_source)
-            ct_target = resize_to_unigradicon_shape(ct_target)
+                loss_object = net(ct_source, ct_target)
+                loss = torch.mean(loss_object.all_loss)
+                losses.append(loss.item())
 
-            loss_object = net(ct_source, ct_target)
-            loss = torch.mean(loss_object.all_loss)
-            losses.append(loss.item())
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise
+            finally:
+                if 'ct_source' in locals():
+                    del ct_source
+                if 'ct_target' in locals():
+                    del ct_target
 
-    mean_loss = np.mean(losses)
-    print(f"  Val   loss: {mean_loss:.4f}")
+    mean_loss = float(np.mean(losses)) if losses else float('nan')
+    logging.info(f"  Val   loss: {mean_loss:.4f} ({len(losses)} paires)")
     return mean_loss
+
+
+# =============================================================================
+# CHECKPOINTS — (C) reprise après crash + (D) sauvegarde à chaque epoch
+# =============================================================================
+
+def save_checkpoint(net, optimizer, epoch, best_val_loss, path):
+    """
+    Sauvegarde l'état complet (modèle + optimizer + epoch + best_val_loss)
+    pour permettre une reprise exacte après crash.
+    """
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': net.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_loss': best_val_loss,
+    }, path)
+
+
+def load_checkpoint(net, optimizer, path):
+    """
+    Recharge un checkpoint et retourne (epoch_de_depart, best_val_loss).
+    """
+    logging.info(f"Reprise depuis {path}")
+    ckpt = torch.load(path, map_location=device)
+    net.load_state_dict(ckpt['model_state_dict'])
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    start_epoch = ckpt['epoch'] + 1
+    best_val_loss = ckpt['best_val_loss']
+    logging.info(f"  Reprise à l'epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+    return start_epoch, best_val_loss
 
 
 # =============================================================================
 # ⚠️ FINE-TUNING CT + PET (futur) — la prof a demandé d'itérer aussi sur PET
 # =============================================================================
 #
-# Idée : entraîner le réseau sur les DEUX modalités, pas seulement CT.
-# Deux approches possibles à discuter avec la prof :
-#
-# APPROCHE A — Loss combinée (CT et PET dans le même forward, pondérée)
+# APPROCHE A — Loss combinée pondérée
 # -----------------------------------------------------------------------
 # def train_one_epoch_ct_pet(net, optimizer, loader, epoch, pet_weight=0.3):
-#     net.train()
-#     losses = []
-#
 #     for batch in tqdm(loader, desc=f"Epoch {epoch}"):
 #         ct_source  = resize_to_unigradicon_shape(batch['ct_source'].to(device))
 #         ct_target  = resize_to_unigradicon_shape(batch['ct_target'].to(device))
 #         pet_source = resize_to_unigradicon_shape(batch['pet_source'].to(device))
 #         pet_target = resize_to_unigradicon_shape(batch['pet_target'].to(device))
-#
 #         optimizer.zero_grad()
-#
-#         # Registration sur CT (phi calculé sur l'anatomie)
-#         loss_object_ct = net(ct_source, ct_target)
-#         loss_ct = torch.mean(loss_object_ct.all_loss)
-#
-#         # Registration sur PET (même réseau, autre paire)
-#         loss_object_pet = net(pet_source, pet_target)
-#         loss_pet = torch.mean(loss_object_pet.all_loss)
-#
-#         # Loss combinée pondérée — CT prioritaire (meilleur contraste anatomique)
+#         loss_ct  = torch.mean(net(ct_source,  ct_target).all_loss)
+#         loss_pet = torch.mean(net(pet_source, pet_target).all_loss)
 #         loss = loss_ct + pet_weight * loss_pet
 #         loss.backward()
 #         optimizer.step()
 #
-#         losses.append(loss.item())
-#
-#     mean_loss = np.mean(losses)
-#     print(f"  Train loss (CT+PET): {mean_loss:.4f}")
-#     return mean_loss
-#
-#
-# APPROCHE B — Alterner les batches CT et PET (curriculum simple)
+# APPROCHE B — Alterner les batches CT et PET
 # -----------------------------------------------------------------------
 # def train_one_epoch_alternating(net, optimizer, loader, epoch):
-#     net.train()
-#     losses = []
-#
 #     for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
 #         if i % 2 == 0:
 #             source = resize_to_unigradicon_shape(batch['ct_source'].to(device))
@@ -193,23 +243,14 @@ def evaluate(net, loader, epoch):
 #         else:
 #             source = resize_to_unigradicon_shape(batch['pet_source'].to(device))
 #             target = resize_to_unigradicon_shape(batch['pet_target'].to(device))
-#
 #         optimizer.zero_grad()
-#         loss_object = net(source, target)
-#         loss = torch.mean(loss_object.all_loss)
+#         loss = torch.mean(net(source, target).all_loss)
 #         loss.backward()
 #         optimizer.step()
 #
-#         losses.append(loss.item())
-#
-#     mean_loss = np.mean(losses)
-#     print(f"  Train loss (alternating CT/PET): {mean_loss:.4f}")
-#     return mean_loss
-#
-# ⚠️ Point à valider avec la prof avant d'implémenter :
-#    - pet_weight : quelle pondération entre CT et PET dans la loss ?
-#    - Le PET a un bruit/contraste très différent du CT — la même loss
-#      similarity (NCC) est-elle adaptée, ou faut-il une loss spécifique PET ?
+# ⚠️ À valider avec la prof :
+#    - pet_weight : quelle pondération CT vs PET ?
+#    - NCC adaptée au PET, ou loss spécifique nécessaire ?
 # =============================================================================
 
 
@@ -218,46 +259,55 @@ def evaluate(net, loader, epoch):
 # =============================================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume_from", default="", type=str,
+                        help="Chemin d'un checkpoint pour reprendre l'entraînement")
+    args = parser.parse_args()
 
-    # 1. Charger le modèle pré-entraîné
-    print("Loading pretrained uniGradICON...")
+    setup_logging()
+    logging.info(f"Device: {device}")
+
+    # 1. Modèle pré-entraîné
+    logging.info("Loading pretrained uniGradICON...")
     net = unigradicon.get_unigradicon()
     net = net.to(device)
-    print("Model loaded ✓")
+    logging.info("Model loaded")
 
-    # 2. Optimizer — lr faible pour fine-tuning
+    # 2. Optimizer
     optimizer = torch.optim.Adam(net.parameters(), lr=LR)
 
-    # 3. Dataloaders
+    # 3. (C) Reprise éventuelle depuis un checkpoint
+    start_epoch = 1
+    best_val_loss = float('inf')
+    if args.resume_from:
+        start_epoch, best_val_loss = load_checkpoint(net, optimizer, args.resume_from)
+
+    # 4. Dataloaders
     train_loader, val_loader = get_dataloaders()
 
-    # 4. Boucle d'entraînement (CT uniquement pour l'instant)
-    best_val_loss = float('inf')
-
-    for epoch in range(1, EPOCHS + 1):
-        print(f"\n--- Epoch {epoch}/{EPOCHS} ---")
+    # 5. Boucle d'entraînement
+    for epoch in range(start_epoch, EPOCHS + 1):
+        t0 = time.time()
+        logging.info(f"--- Epoch {epoch}/{EPOCHS} ---")
 
         train_loss = train_one_epoch(net, optimizer, train_loader, epoch)
 
+        # (D) Sauvegarde du "last" à CHAQUE epoch (reprise après crash)
+        save_checkpoint(net, optimizer, epoch, best_val_loss,
+                        os.path.join(SAVE_DIR, "unigradicon_last.pth"))
+
+        # Évaluation
         if epoch % EVAL_EVERY == 0:
             val_loss = evaluate(net, val_loader, epoch)
-
-            # Sauvegarder le meilleur modèle
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(
-                    net.state_dict(),
-                    os.path.join(SAVE_DIR, f"unigradicon_finetuned_best.pth")
-                )
-                print(f"  ✅ Meilleur modèle sauvegardé (val_loss={val_loss:.4f})")
+                save_checkpoint(net, optimizer, epoch, best_val_loss,
+                                os.path.join(SAVE_DIR, "unigradicon_best.pth"))
+                logging.info(f"  Nouveau meilleur modele (val_loss={val_loss:.4f})")
 
-        # Checkpoint régulier
-        if epoch % 10 == 0:
-            torch.save(
-                net.state_dict(),
-                os.path.join(SAVE_DIR, f"unigradicon_epoch_{epoch}.pth")
-            )
+        dt = time.time() - t0
+        logging.info(f"  Epoch {epoch} terminee en {dt/60:.1f} min")
 
-    print("\n✅ Fine-tuning terminé !")
-    print(f"   Meilleur val_loss: {best_val_loss:.4f}")
-    print(f"   Modèle sauvegardé: {SAVE_DIR}/unigradicon_finetuned_best.pth")
+    logging.info("Fine-tuning termine")
+    logging.info(f"  Meilleur val_loss: {best_val_loss:.4f}")
+    logging.info(f"  Modeles dans: {SAVE_DIR}")
