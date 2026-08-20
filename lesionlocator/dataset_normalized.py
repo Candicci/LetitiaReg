@@ -84,17 +84,13 @@ def get_timepoint_pairs(
 
 
 def resample_pet_to_ct_spacing(pet_image: sitk.Image, ct_image: sitk.Image) -> np.ndarray:
-    ct_spacing = ct_image.GetSpacing()
-    pet_spacing = pet_image.GetSpacing()
-    pet_array = sitk.GetArrayFromImage(pet_image)
-    pet_array_4d = pet_array[np.newaxis, ...]
-    pet_resampled = resample_data_or_seg_to_spacing(
-        data=pet_array_4d,
-        current_spacing=pet_spacing[::-1],
-        new_spacing=ct_spacing[::-1],
-        is_seg=False
-    )
-    return pet_resampled[0]
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(ct_image)      # grille CT : même origin/spacing/direction/size
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(0.0)
+    pet_resampled = resampler.Execute(pet_image)
+    return sitk.GetArrayFromImage(pet_resampled).astype(np.float32)
+
 
 
 # =============================================================================
@@ -176,6 +172,11 @@ class CTPETDataset(Dataset):
             pet_source_array = sitk.GetArrayFromImage(pet_source).astype(np.float32)
             pet_target_array = sitk.GetArrayFromImage(pet_target).astype(np.float32)
 
+
+        assert ct_source_array.shape == pet_source_array.shape, \
+            f"Shape mismatch CT/PET après resampling: {ct_source_array.shape} vs {pet_source_array.shape}"
+        assert ct_target_array.shape == pet_target_array.shape, \
+            f"Shape mismatch CT/PET après resampling: {ct_target_array.shape} vs {pet_target_array.shape}"
         # =====================================================
         # NORMALISATION CT (stats globales dataset)
         # =====================================================

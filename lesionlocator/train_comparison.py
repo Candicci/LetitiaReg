@@ -3,7 +3,6 @@ evaluate_two_pass.py  —  comparaison 3-voies SANS OOM (two-pass)
 ================================================================
 Le V100 (~15 Go) ne tient pas les DEUX modèles à la fois (uniGradICON + RegNet).
 Solution : deux passes séquentielles, un seul modèle sur le GPU à la fois.
-
   PASSE 1 : uniGradICON  → baseline + CT-transfer (+ contrôle CT) sur toutes les paires
   [libération complète du GPU]
   PASSE 2 : RegNet       → PET-native sur toutes les paires
