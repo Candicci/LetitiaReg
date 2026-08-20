@@ -39,3 +39,21 @@ ax.grid(alpha=0.3)
 fig.tight_layout()
 fig.savefig('scatter_paired_corrected.png', dpi=150)
 print("\nFigure sauvegardée : scatter_paired_corrected.png")
+
+from scipy.stats import wilcoxon
+
+# --- Hypothèse faible : CT-transfer vs baseline (n=13, appairé) ---
+stat, p = wilcoxon(df['ncc_ct_transfer'], df['ncc_baseline'])
+print(f"\nWilcoxon (CT-transfer vs baseline, n={len(df)}) : statistique={stat:.1f}, p={p:.4f}")
+if p < 0.05:
+    print("  → différence statistiquement significative (p<0.05)")
+else:
+    print("  → pas de significativité statistique établie")
+
+# --- Hypothèse forte : CT-transfer vs PET-native (n=6, appairé) ---
+stat2, p2 = wilcoxon(paired['ncc_ct_transfer'], paired['ncc_pet_native'])
+print(f"Wilcoxon (CT-transfer vs PET-native, n={len(paired)}) : statistique={stat2:.1f}, p={p2:.4f}")
+if p2 < 0.05:
+    print("  → différence statistiquement significative (p<0.05)")
+else:
+    print("  → pas de significativité statistique établie (échantillon probablement trop petit)")
