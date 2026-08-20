@@ -38,6 +38,13 @@ CT_INTENSITY_PROPERTIES = {
     'percentile_99_5': 1125.0000,
 }
 
+# Patients exclus : écart de couverture axiale CT/PET > 5mm à TP0
+# (cf. check_alignment_all_patients.py — probable différence de protocole d'acquisition,
+#  pas un bug de recalage ; exclus par précaution pour éviter du padding silencieux)
+Z_MISALIGNED_PATIENTS = {
+    '061', '107', '108', '109', '223', '256', '289', '317',
+    '384', '394', '396', '397', '401', '445', '452', '470', '476', '492'
+}
 
 def parse_filename(filename: str) -> Tuple[str, str]:
     basename = filename.replace('.nii.gz', '').replace('.nii', '')
@@ -222,8 +229,9 @@ def train_val_split(
     dataset = scan_dataset(ct_dir, pet_dir)
     valid_patients = sorted([
         pid for pid, data in dataset.items()
-        if len(data) >= 2
+        if len(data) >= 2 and pid not in Z_MISALIGNED_PATIENTS
     ])
+    print(f"Exclus pour couverture Z incohérente: {len(Z_MISALIGNED_PATIENTS)} patients")
     rng = np.random.RandomState(seed)
     rng.shuffle(valid_patients)
     n_val = int(len(valid_patients) * val_ratio)
