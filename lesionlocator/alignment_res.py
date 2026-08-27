@@ -1,4 +1,3 @@
-# generate_alignment_proof.py
 import sys, os
 sys.path.insert(0, '/home/chiara')
 sys.path.insert(0, '/home/chiara/LesionLocator/lesionlocator')
@@ -9,7 +8,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dataset_normalized import resample_pet_to_ct_spacing  # version CORRIGÉE
+from dataset_normalized import resample_pet_to_ct_spacing  
 from preprocessing.resampling.default_resampling import resample_data_or_seg_to_spacing
 
 PID = '008'
@@ -22,7 +21,7 @@ ct  = sitk.ReadImage(CT_PATH)
 pet = sitk.ReadImage(PET_PATH)
 ct_array = sitk.GetArrayFromImage(ct)
 
-# --- ANCIENNE méthode (spacing seul, bug) ---
+# --- ANCIENNE méthode (spacing seul) ---
 pet_spacing_only = resample_data_or_seg_to_spacing(
     data=sitk.GetArrayFromImage(pet)[np.newaxis, ...],
     current_spacing=pet.GetSpacing()[::-1],
